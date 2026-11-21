@@ -18,8 +18,11 @@ from aetherflow.backends.cuda import codegen as _cuda
 # 一致，所以 unsigned short 与 _Float16 之间用 __builtin_bit_cast 互转即可，
 # 不需要 include 任何头文件。
 #
-# 16 位原子加仍然用 CAS 循环：CUDA 的 atomicAdd 没有 unsigned short 重载
-# （探针已确认），atomicCAS 有 16 位版本。
+# 16 位原子加仍然用 CAS 循环，但**不能**直接调 `atomicCAS(unsigned short*)`：
+# 天数 device runtime 只提供 int / unsigned int / unsigned long long 三个重载
+# （实测报 "no matching function for call to 'atomicCAS'"）。这里与 CUDA sm<60
+# 走同一条路：把 CAS 加宽到对齐的 32 位字，只替换目标半字。算法逐字照搬
+# `aetherflow.backends.cuda.codegen` 的 `af_cas_h` 非 16 位原子分支。
 _ILUVATAR_F16_HELPERS = r"""
 __device__ __forceinline__ float af_ld_h(unsigned short h) {
     return (float)__builtin_bit_cast(_Float16, h);
@@ -27,12 +30,30 @@ __device__ __forceinline__ float af_ld_h(unsigned short h) {
 __device__ __forceinline__ unsigned short af_st_h(float v) {
     return __builtin_bit_cast(unsigned short, (_Float16)v);
 }
+__device__ __forceinline__ unsigned short af_cas_h(unsigned short* p,
+                                                   unsigned short assumed,
+                                                   unsigned short v) {
+    unsigned long long addr = (unsigned long long)p;
+    unsigned int* base = (unsigned int*)(addr & ~2ULL);
+    unsigned int shift = (addr & 2ULL) ? 16u : 0u;
+    unsigned int mask = (addr & 2ULL) ? 0xFFFF0000u : 0x0000FFFFu;
+    unsigned int other = *base & ~mask;
+    for (;;) {
+        unsigned int assumed32 = other | (((unsigned int)assumed) << shift);
+        unsigned int desired = other | (((unsigned int)v) << shift);
+        unsigned int prev = atomicCAS(base, assumed32, desired);
+        if (prev == assumed32) return assumed;
+        unsigned short got = (unsigned short)((prev & mask) >> shift);
+        if (got != assumed) return got;
+        other = prev & ~mask;
+    }
+}
 __device__ __forceinline__ float af_add_h(unsigned short* p, float v) {
     unsigned short old = *p;
     unsigned short assumed;
     do {
         assumed = old;
-        old = atomicCAS(p, assumed, af_st_h(af_ld_h(assumed) + v));
+        old = af_cas_h(p, assumed, af_st_h(af_ld_h(assumed) + v));
     } while (assumed != old);
     return af_ld_h(old);
 }

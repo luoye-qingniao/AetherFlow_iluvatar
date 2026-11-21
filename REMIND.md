@@ -88,9 +88,46 @@ password: K4QgJolw
 - [x] 真机：`install_hardware` 成功，`get_backend("iluvatar")` 构造成功
       （`Iluvatar MR-V100`，32GB，runtime 10020）
 - [x] 真机：最小 conformance（`add_basic` / `sub_basic`）PASS，err=0
-- [ ] 真机：全量 111 用例 conformance
-- [ ] 真机：框架自带的 GPU 相关测试
-- [ ] 性能：`CONV_AUTO_IMPLICIT` 是否需要按天数的实测结果覆盖
+- [x] 真机：**全量 conformance PASS**（104 executed / 7 refused / 0 failed，
+      68/68 算子覆盖，耗时 15.7s）
+- [x] 真机：f16 全链路（attention 含 dropout、逐元素+归约、matmul 走
+      `cublasGemmEx`、`embedding_backward` 的 f16 原子加）
+- [x] 真机：`memory_mode="tiered"`、`graph_mode="auto"`、`capture`（matmul 重放 /
+      常量广播 / slice 视图）全 PASS
+- [x] 真机：设备态训练 PASS（SGD / Adam 轨迹与主机态逐位对齐、
+      `clip_global_norm`、`verify_device_state`）
+- [x] 本地框架测试：`tests/test_train.py` + `tests/test_conformance.py`
+      → 59 passed, 4 skipped
+- [ ] 性能：`CONV_AUTO_IMPLICIT` 是否需要按天数的实测结果覆盖（正确性已过，
+      后续用真实模型 benchmark 决定）
+- [ ] `CONV_IMPLS` 的 implicit/tiled/grouped 各自只被 conformance 的代表用例覆盖，
+      大规模形状未做性能对比
+
+## 训练层接入（框架侧唯一改动）
+
+`aetherflow/train/_arrays.py` 的 `array_module` 原本硬编码 numpy / cupy / HIP，
+第三方容器会落到 numpy 分支（对 `DeviceArray` 做整数索引 → TypeError）。
+新增 7 行的通用注册点：
+
+```python
+register_array_module(matches, module)   # 表在 array_module 里于 numpy 兜底前查
+```
+
+`iluvatar_af/__init__.py` 在导入时注册 `(isinstance(v, DeviceArray), runtime)`。
+老框架没有这个函数时静默跳过（主机态训练仍可用）。HIP / CUDA 行为不变，
+`test_train` 59 项全过。
+
+## 验证结果（2026-11-21）
+
+```
+conformance: 104 executed / 7 refused / 0 failed, 68/68 ops, 15.7s
+[PASS] f16 attention plain / dropout
+[PASS] f16 elementwise+reduce / matmul (cublasGemmEx)
+[PASS] memory_mode=tiered / graph_mode=auto
+[PASS] capture matmul replay / constant broadcast / slice view
+[PASS] SGD device_state trajectory / Adam device_state trajectory
+[PASS] clip_global_norm on device
+```
 
 ## 踩过的坑
 
@@ -105,3 +142,18 @@ password: K4QgJolw
    `CUBLAS_GEMM_DEFAULT=-1`（HIP 160）、10.2 的 `cublasGemmEx` 里
    computeType 是 `cudaDataType`（`CUDA_R_32F=0`），不是 11.x 的 68。
    正式符号带 `_v2` 后缀（`cublasCreate_v2`），`blas.py` 里两个都试。
+5. **天数没有 `atomicCAS(unsigned short*)`**：device runtime 只提供
+   `int` / `unsigned int` / `unsigned long long` 三个重载。f16 原子加若直接
+   调 16 位 CAS，连不引用它的 attention 模板都会在函数定义处报
+   "no matching function for call to 'atomicCAS'"。修法与 CUDA sm<60 相同：
+   `af_cas_h` 把 CAS 加宽到对齐的 32 位字，只替换目标半字（见
+   `iluvatar_af/codegen.py::_ILUVATAR_F16_HELPERS`）。
+6. 远端 `nohup python /tmp/x.py` 的 `sys.path[0]` 是 `/tmp`，`import aetherflow`
+   会失败——脚本里显式 `sys.path.insert(0, "/home/ubuntu/aetherflow")`。
+   `pgrep -f x.py` 会匹配到轮询命令自身，判断结束要看日志里的 `DONE_MARKER`。
+7. `hardware.build_factory()` 收的是 `HardwareRecord`，不是名字字符串；
+   `HardwareRecord` 没有 `.path`（只有 `.root`）；`installed_hardware()`
+   返回名字列表。`HardwareRecord.name` 是包名，`HardwareRecord.api` 是声明值。
+8. 远端框架的 `aetherflow/train/_arrays.py` 是**手动上传补丁**覆盖的，不是
+   仓库同步；重新 clone 远端框架后要先确认这个注册点还在（否则设备态训练
+   会退回 TypeError）。正式发布应以本地 aetherflow 仓库的提交为准。
