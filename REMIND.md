@@ -316,3 +316,20 @@ PV 侧成对读取未做：它需要每线程负责 2 个通道，partial 数翻
     注意：缺陷在 aetherflow 主框架里，硬件包 zip 只含 `iluvatar_af/`；天数机器
     要把主框架更新到含 5.292 的提交，包侧未改动则不必重打包。若同时改了包内
     代码，仍按坑 9 重打包 + `install_hardware(..., replace=True)` 重装。
+
+### 主框架两处修复的真机复验（2026-11-21）
+
+两处都改了主框架（`aetherflow`），硬件包未动，按坑 12 的说明只需更新主框架源码。
+
+1. **`(1,1,S,T)` mask 直传**：`bh=2×2`、`S=T=32`、`D=64`、`scale=0.125`、f16，
+   与 numpy 逐点对拍 **max abs err = 8.442e-04**（f16 量级），旧代码此处抛
+   `TypeError: CUDA 容器只支持切片（不降维）`。
+2. **坏包诊断**（坑 9 的报错质量）：篡改已安装目录里的 `iluvatar_af/rtc.py`
+   后，**新进程** `get_backend("iluvatar")` 报
+   `LookupError: 未注册的后端 'iluvatar'；已注册: cuda、hip、reference。注意：
+   硬件包目录 'iluvatar' 存在但校验未通过，已被跳过：'iluvatar_af/rtc.py'
+   摘要不符（声明 c7f8180…，实际 5bad813…）；包在打包后被改动过。不要直接
+   覆盖已安装的文件，请重新打包后用 install_hardware(<zip 路径>, replace=True)
+   重装`。必须用新进程验证：同进程内 `_FACTORIES` 已缓存注册结果。
+3. **回归**：文件还原后全量 `run_conformance` → `PASS`（104 executed /
+   7 refused / 0 failed），attention 重写未退化。
