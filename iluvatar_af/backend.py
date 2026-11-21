@@ -221,10 +221,18 @@ class IluvatarBackend(DeviceBackend):
     # ------------------------------------------------------------------
 
     def _kernel(self, key, source, func: str):
-        # 源码可以延迟到用时再生成（CUDA 侧命中缓存就完全不算源码）；
-        # CUDA 的缓存键带源码摘要，所以这里仍然要拿到字符串。
+        # 先按 key 查已加载的函数句柄，命中就完全不同生成源码。``source`` 允许
+        # 是"返回源码的函数"，而每次生成（L2 → C）要遍历一遍表达式树（MR-V100
+        # 实测单节点约 30 µs，是纯 launcher 开销的三分之一）。key 由框架保证
+        # 唯一标识内核身份——CUDA 后端也是同一约定（cuda/backend.py::_kernel）。
+        cache_key = (key, func)
+        fn = self._functions.get(cache_key)
+        if fn is not None:
+            return fn
         text = source() if callable(source) else source
-        return runtime.function(key, text, func, func)
+        fn = runtime.function(key, text, func, func)
+        self._functions[cache_key] = fn
+        return fn
 
     def _cublas(self):
         """cuBLAS handle 惰性创建：图里没有 matmul 就不加载库。"""

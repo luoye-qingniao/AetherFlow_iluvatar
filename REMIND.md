@@ -98,10 +98,11 @@ password: K4QgJolw
       `clip_global_norm`、`verify_device_state`）
 - [x] 本地框架测试：`tests/test_train.py` + `tests/test_conformance.py`
       → 59 passed, 4 skipped
-- [ ] 性能：`CONV_AUTO_IMPLICIT` 是否需要按天数的实测结果覆盖（正确性已过，
-      后续用真实模型 benchmark 决定）
-- [ ] `CONV_IMPLS` 的 implicit/tiled/grouped 各自只被 conformance 的代表用例覆盖，
-      大规模形状未做性能对比
+- [x] 性能第一轮：内核句柄缓存 + 设备内存池 + launcher 热路径
+      （见"性能优化（2026-11-21）"一节）
+- [x] 性能实测：`CONV_IMPLS` 的大规模形状对比（tiled/grouped 慢 23×，不推荐）
+- [ ] attention 内核：共享模板"一行一个 block + K 读取不合并"，实测 ~123 GFLOPS，
+      拟在天数包内另写一版（见"性能优化"一节的结论）
 
 ## 训练层接入（框架侧唯一改动）
 
@@ -128,6 +129,86 @@ conformance: 104 executed / 7 refused / 0 failed, 68/68 ops, 15.7s
 [PASS] SGD device_state trajectory / Adam device_state trajectory
 [PASS] clip_global_norm on device
 ```
+
+## 性能优化（2026-11-21）
+
+方法：先端到端、再纯内核、再 launch/图捕获/训练步，最后 cProfile 定位。
+测量口径统一为 `execute_device()` + `DeviceArray` 直接喂入，排除
+H2D/D2H——`execute()` 的数字被 PCIe 主导，看不出后端开销。
+
+cProfile 在前四轮里给出两个真正的热点：
+
+| 热点 | 单次代价 | 成因 |
+| --- | --- | --- |
+| `runtime.free` | ~35 µs/节点 | `cudaFree` 在天数驱动上是隐式同步点，逐节点"分配→执行→回收"= 每节点一次全设备同步 |
+| `_kernel` 重建源码 | ~30 µs/节点 | key 已含 dtype/epilogue/steps/vec 等全部影响源码的因素，却每次仍遍历表达式树重新生成 L2→C |
+
+改了三处：
+
+1. **内核句柄缓存**（[backend.py](file:///g:/Cloumi/aetherflow_iluvatar/iluvatar_af/backend.py)）：
+   `_kernel(key, source, func)` 先查 `(key, func)` → 函数句柄表，命中直接返回，
+   `source` 支持传"返回源码的函数"以便真正惰性。key 由框架保证唯一标识内核身份，
+   与 `cuda/backend.py::_kernel` 同一约定——不会串味（已用 add/add128/mlp 抽查，
+   误差 0.0 / 0.0 / 1.2e-03）。
+2. **设备内存池**（[runtime.py](file:///g:/Cloumi/aetherflow_iluvatar/iluvatar_af/runtime.py)）：
+   按 512 B 对齐分桶缓存空闲块，`free(ptr, nbytes)` 有尺寸就归还池、无尺寸仍直释
+   （arena/tiered 块保持原路径）；`_capturing` 期间不经过池。上限
+   `AETHERFLOW_IVCORE_POOL_MB`（默认 2048，`0`=关闭），另有 `empty_cache()` /
+   `pool_stats()`。图里 8 个节点的中间张量因此只申请一次。
+3. **launcher 热路径**：参数打包按 `type(value)` 内联（`DeviceArray`→`c_void_p`、
+   `np.float32/64/uint64` 分支），其余回退 `_pack`；`_template` 加模块级缓存，
+   key 为 `(name, np.dtype(dtype).str, template)`。
+
+实测（MR-V100，`execute_device`，µs）：
+
+| 场景 | 优化前 | 优化后 |
+| --- | --- | --- |
+| relu64 eager | 117 | 32.7 |
+| relu64 graph-auto | 158 | 31.7 |
+| 1 × relu 1M | 124 | 39.3 |
+| 2 × relu 1M | 200 | 72.1 |
+| 4 × relu 1M | 374 | 120.0 |
+| 8 × relu 1M | 694 | 184.2 |
+| mlp eager | 237 | 103.9 |
+| mlp graph-auto | 102 | 106.9 |
+| train step 128×64 graph=off | 2226 | 1803 |
+| train step 128×64 graph=auto | 1476 | 1322 |
+
+图捕获已无优势（mlp 102→107）：省下来的正是池与句柄缓存已经消掉的那部分
+CPU 开销，且 capture 本身有额外分支。池在基准结束时 38.9 MB / 21 块，
+`empty_cache()` 后全部归还。
+
+正确性没有放松：优化后真机全量 conformance **104 executed / 7 refused /
+0 failed，68/68 ops，PASS**；本地 `tests/test_train.py tests/test_conformance.py`
+59 passed, 4 skipped。
+
+### 算力扫描（决定"下一步优化什么"）
+
+| 项 | 形状 | 耗时 | 算力 |
+| --- | --- | --- | --- |
+| matmul f16 | 2048³ | 0.232 ms | 74 TFLOPS |
+| matmul f16 | 4096³ | 1.413 ms | 97 TFLOPS |
+| attention f16 | 4×8×512×64 | 18.1 ms | 123 GFLOPS |
+| attention f16 | 16×16×512×64 | 137.9 ms | 133 GFLOPS |
+| attention f16 | 2×2×2048×64 | 40.3 ms | 103 GFLOPS |
+| attention f16 | 4×8×512×128 | 41.6 ms | 131 GFLOPS |
+
+结论：
+
+- **f16 matmul 已接近上限**（走 `cublasGemmEx`），不再动。
+- **attention 是唯一的大头**，且与形状无关地停在 ~123 GFLOPS：共享模板
+  `ATTENTION_SRC` 是"一行一个 block、每线程串行扫 D 维算一个 key 的 dot"，
+  K 的读取步长 128 B、完全不合并；每 chunk 还有两次 `block_reduce`。
+  这是 CUDA 模板的固有结构，不是天数特有缺陷。收益预期 5–10×，做法是在天数
+  包内覆盖 `attention_source`（warp=64 下按 D 拆 warp + shuffle 归约），
+  约束是保持 mask/dropout 的 RNG 索引仍是 `(bh*S+s)*T+t`，且保证与现结果位级一致。
+- **conv 的 tiled/grouped 实现慢 23×**（f32 8×64×112² 3×3：auto/im2col ≈5.55 ms，
+  implicit 18.3 ms，tiled/grouped 129 ms），`auto` 不选它们是对的；
+  `CONV_AUTO_IMPLICIT=False` 保持。小通道 C=3 时 `auto` 选了 tiled（0.827 ms）
+  而 im2col 只要 0.515 ms，属已知策略缺陷，收益小、暂不改。
+- **未做 Adam 融合**（26 次逐元素 launch → 2 次，训练步还能再省约 40%）：
+  会改变 Adam 的数值轨迹，破坏"与主机态逐位对齐"的验收基线。风险大于收益，
+  除非另建一套宽松的对齐判据。
 
 ## 踩过的坑
 
@@ -157,3 +238,12 @@ conformance: 104 executed / 7 refused / 0 failed, 68/68 ops, 15.7s
 8. 远端框架的 `aetherflow/train/_arrays.py` 是**手动上传补丁**覆盖的，不是
    仓库同步；重新 clone 远端框架后要先确认这个注册点还在（否则设备态训练
    会退回 TypeError）。正式发布应以本地 aetherflow 仓库的提交为准。
+9. **不能用 sftp 直接覆盖已安装目录里的 `.py`**。`manifest.json` 带每个文件的
+   sha256 清单，覆盖后校验失败，`installed_hardware()` 返回空，
+   `get_backend("iluvatar")` 报"未注册的后端 iluvatar"（且报错点离真实原因很远）。
+   任何改动都必须 `py -3.10 build.py` 重打包，再
+   `install_hardware(zip_path, replace=True)`。
+10. `runtime.py` **模块级定义了设备函数 `sum`**（同名覆盖内置），所以文件里
+    任何模块级/方法内的 `sum(...)` 都会拿到设备算子，`pool_stats` 因此报
+    `int + DeviceArray`。改用显式循环计块数。`max` / `min` 未被覆盖。
+    后续在此文件里写辅助逻辑时要留意同名覆盖。

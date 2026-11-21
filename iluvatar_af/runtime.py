@@ -26,6 +26,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import hashlib
+import os
 
 import numpy as np
 
@@ -54,6 +55,16 @@ _D2D = 3
 HOST_TO_DEVICE = _H2D
 DEVICE_TO_HOST = _D2H
 DEVICE_TO_DEVICE = _D2D
+
+# 设备内存池的块对齐粒度。池按对齐后的字节数分桶，同一形状重复执行才能命中；
+# 512 是 cudaMalloc 自身的对齐量级，再细的分桶只会让块数暴涨。
+_POOL_ALIGN = 512
+
+
+def _pool_key(nbytes: int) -> int:
+    """池的分桶键：申请字节数向上对齐到 ``_POOL_ALIGN``。"""
+    return (int(nbytes) + _POOL_ALIGN - 1) // _POOL_ALIGN * _POOL_ALIGN
+
 
 # 视图与 strided copy 的最大维数。超过时先折叠相邻维；仍超过则明确拒绝。
 _MAX_DIMS = 4
@@ -162,6 +173,16 @@ def get_allocator():
     return _Runtime.instance().get_allocator()
 
 
+def empty_cache() -> int:
+    """把设备内存池的缓存块还给驱动，返回释放的字节数（会有一次隐式同步）。"""
+    return _Runtime.instance().empty_cache()
+
+
+def pool_stats() -> dict:
+    """设备内存池的当前占用（``bytes`` / ``blocks`` / ``limit``）。"""
+    return _Runtime.instance().pool_stats()
+
+
 def capture(stream: "_Stream") -> "_CaptureSession":
     return _Runtime.instance().capture(stream.ptr)
 
@@ -261,7 +282,8 @@ class _Buffer:
 
     def __del__(self) -> None:
         try:
-            _Runtime.instance().free(self.ptr)
+            # 带上字节数：默认分配器下的块要归还内存池（见 ``_Runtime.free``）
+            _Runtime.instance().free(self.ptr, self.nbytes)
         except Exception:  # 解释器退出时驱动可能已经不在了
             pass
 
@@ -725,6 +747,18 @@ class _Runtime:
         self._capture_host = None
         # 底层分配器：None 表示每次直接向驱动要；捕获期换成 arena
         self._allocator = None
+        # 设备内存块缓存。``cudaFree`` 在天数驱动上是隐式同步点——它要等设备上
+        # 已排队的全部工作结束才回收。逐节点执行时"分配→执行→回收"会让每个
+        # 节点末尾卡一次同步（MR-V100 实测 35 µs/次，约占单节点耗时三分之一），
+        # 也让 CPU 无法把下一步的 launch 排到队列里。这里按对齐字节数分桶，
+        # 命中就完全不走驱动；上限由 ``AETHERFLOW_IVCORE_POOL_MB`` 控制。
+        self._pool: dict = {}  # 对齐字节数 -> [ptr, ...]
+        self._pool_bytes = 0
+        try:
+            limit_mb = int(os.environ.get("AETHERFLOW_IVCORE_POOL_MB", "2048"))
+        except ValueError:
+            limit_mb = 2048
+        self._pool_limit = (limit_mb if limit_mb > 0 else 0) << 20
         # SM 数按设备缓存；0 表示驱动没给出（调用方退回不按 SM 数铺块）
         self._sm_count: dict = {}
 
@@ -904,7 +938,66 @@ class _Runtime:
         allocator = self._allocator
         if allocator is not None:
             return allocator(nbytes)
-        return _Buffer(self.malloc(nbytes), nbytes)
+        if self._capturing:
+            # 捕获期的地址由 arena 统一铺，且不允许发生新的 cudaMalloc
+            return _Buffer(self.malloc(nbytes), nbytes)
+        ptr = self._pool_take(nbytes)
+        if ptr is None:
+            ptr = self.malloc(_pool_key(nbytes))
+        return _Buffer(ptr, nbytes)
+
+    # ------------------------------------------------------------------
+    # 内存池
+    # ------------------------------------------------------------------
+
+    def _pool_take(self, nbytes: int):
+        """从池里取一块不小于 ``nbytes`` 的块；没有则返回 ``None``。"""
+        key = _pool_key(nbytes)
+        bucket = self._pool.get(key)
+        if not bucket:
+            return None
+        self._pool_bytes -= key
+        return bucket.pop()
+
+    def _pool_give(self, ptr: int, nbytes: int) -> bool:
+        """归还一块到池里；超过上限则返回 ``False``（调用方走 cudaFree）。"""
+        key = _pool_key(nbytes)
+        if key <= 0 or self._pool_bytes + key > self._pool_limit:
+            return False
+        self._pool.setdefault(key, []).append(int(ptr))
+        self._pool_bytes += key
+        return True
+
+    def empty_cache(self) -> int:
+        """把池里的块真正还给驱动，返回释放的字节数。
+
+        会有一次隐式同步：调用方应在"设备已空闲"的位置使用（例如一段基准
+        结束时），不要放进热路径。
+        """
+        freed = 0
+        for key, bucket in self._pool.items():
+            for ptr in bucket:
+                self._lib.cudaFree(ctypes.c_void_p(int(ptr)))
+                freed += key
+            bucket.clear()
+        self._pool.clear()
+        self._pool_bytes = 0
+        return freed
+
+    def pool_stats(self) -> dict:
+        """池的当前占用：``bytes`` 缓存字节、``blocks`` 块数、``limit`` 上限。
+
+        注意本模块把 ``sum`` / ``max`` 导出成了设备算子，这里只能用循环或
+        ``builtins``，否则会把标量当作设备数组去算。
+        """
+        blocks = 0
+        for bucket in self._pool.values():
+            blocks += len(bucket)
+        return {
+            "bytes": self._pool_bytes,
+            "blocks": blocks,
+            "limit": self._pool_limit,
+        }
 
     # ------------------------------------------------------------------
     # 内存
@@ -926,12 +1019,19 @@ class _Runtime:
             )
         return ptr.value
 
-    def free(self, ptr: int) -> None:
+    def free(self, ptr: int, nbytes: int = 0) -> None:
+        """回收一块显存。给了 ``nbytes`` 就归还内存池，否则直接 cudaFree。
+
+        ``nbytes`` 只有 ``_Buffer`` 知道（arena / tiered 的块由各自分配器管，
+        不该进这个池），所以缺省值保持"直接释放"。
+        """
         if not ptr:
             return
         if self._capturing:
             # 见 ``_deferred_free``：捕获窗口里的 cudaFree 会让捕获失效
             self._deferred_free.append(ptr)
+            return
+        if nbytes and self._pool_give(ptr, nbytes):
             return
         self._lib.cudaFree(ctypes.c_void_p(ptr))
 
@@ -1299,11 +1399,36 @@ class CudaFunction:
 
     def __call__(self, grid, block, args, shared_mem: int = 0) -> None:
         """``shared_mem`` 对应 CUDA 侧 ``RawKernel(..., shared_mem=N)`` 的用法：
-        attention 与分块卷积按形状动态申请共享内存。"""
-        holders = [_pack(a) for a in args]
-        params = (ctypes.c_void_p * len(holders))(
-            *[ctypes.cast(ctypes.byref(h), ctypes.c_void_p) for h in holders]
-        )
+        attention 与分块卷积按形状动态申请共享内存。
+
+        逐元素通道每步要启动几十个这样的内核，参数打包因此按类型内联
+        （``_pack`` 留作回退，承载报错信息）：类型比较比 `isinstance` +
+        `dtype` 比较快，省下的是纯 CPU 开销，天数的 launch 延迟本来就低，
+        Python 侧成了瓶颈。
+        """
+        n = len(args)
+        params = (ctypes.c_void_p * n)()
+        holds = [None] * n
+        byref = ctypes.byref
+        cast = ctypes.cast
+        for i, value in enumerate(args):
+            kind = type(value)
+            if kind is DeviceArray:
+                holder = ctypes.c_void_p(value.ptr)
+            elif kind is np.float32:
+                holder = ctypes.c_float(value)
+            elif kind is np.int32:
+                holder = ctypes.c_int(value)
+            elif kind is np.int64:
+                holder = ctypes.c_longlong(value)
+            elif kind is np.float64:
+                holder = ctypes.c_double(value)
+            elif kind is np.uint64:
+                holder = ctypes.c_ulonglong(value)
+            else:
+                holder = _pack(value)
+            holds[i] = holder
+            params[i] = cast(byref(holder), ctypes.c_void_p)
         self._runtime.launch(self, grid, block, params, shared_mem)
 
 
@@ -1800,12 +1925,22 @@ def _launch_shape(n: int):
     return max(1, min(_MAX_BLOCKS, (n + _BLOCK - 1) // _BLOCK)), _BLOCK
 
 
+_TEMPLATE_CACHE: dict = {}
+
+
 def _template(dtype: np.dtype, template: str, name: str):
-    """按 dtype 展开 ``%T%`` 并编译（按 dtype 缓存，源码不同即不同函数）。"""
-    text = template.replace("%T%", _C_TYPES[np.dtype(dtype)])
-    return _Runtime.instance().function(
-        (name, np.dtype(dtype).str), text, name, name
-    )
+    """按 dtype 展开 ``%T%`` 并编译（按 dtype 缓存，源码不同即不同函数）。
+
+    缓存这一层是因为 ``_Runtime.function`` 的键要算一次源码 sha1：训练层的
+    优化器每步要走 20 多次逐元素内核，重复展开 + 摘要每次约 7 µs。
+    """
+    key = (name, np.dtype(dtype).str, template)
+    fn = _TEMPLATE_CACHE.get(key)
+    if fn is None:
+        text = template.replace("%T%", _C_TYPES[np.dtype(dtype)])
+        fn = _Runtime.instance().function(key[:2], text, name, name)
+        _TEMPLATE_CACHE[key] = fn
+    return fn
 
 
 def _broadcast_shape(a: tuple, b: tuple) -> tuple:
