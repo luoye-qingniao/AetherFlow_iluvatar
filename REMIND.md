@@ -107,6 +107,9 @@ password: K4QgJolw
       QK^T → softmax → PV → rescale，512×512×64 降到 **1.394 ms /
       24653 GFLOPS**（18.1 ms 的 13×，已达 522 GB/s 硬下限的 87.5%），
       对拍 7 项 + 全量 conformance 仍 PASS（见"GEMM 物化 attention"一节）
+- [x] TCU flash attention（自写内核，`bench/tcu_flash_attn.cu`）：NW=16 结构、
+      每轮归约的安全档 **0.8309 ms / 41350 GFLOPS**，为物化基线的 1.68×；
+      未接入包内，待验证 Δ 平移 + mask/dropout 后再接（见"TCU flash attention"一节）
 
 ## 训练层接入（框架侧唯一改动）
 
@@ -478,3 +481,99 @@ PV 侧成对读取未做：它需要每线程负责 2 个通道，partial 数翻
    重装`。必须用新进程验证：同进程内 `_FACTORIES` 已缓存注册结果。
 3. **回归**：文件还原后全量 `run_conformance` → `PASS`（104 executed /
    7 refused / 0 failed），attention 重写未退化。
+
+## TCU flash attention（自写内核，进行中）
+
+目标：绕开 HBM 物化（当前 1.394 ms 的 87.5% 已是带宽下限），直接吃 tensor
+core 的 flash 路径。代码在 [bench/tcu_flash_attn.cu](file:///g:/Cloumi/aetherflow_iluvatar/bench/tcu_flash_attn.cu)，
+**不在 `iluvatar_af/` 内，不会被打进硬件包**，是明天接入的基础。
+
+### TCU（tensor core）事实（读头文件 + 实测确认）
+
+- 头文件 `<crt/iluvatar_mma.h>` + `using namespace ixix::wmma;`。
+- **一个 mma 必须 64 线程**（一个 ivcore warp，warpSize=64）；不足 64 线程
+  参与会算错。
+- `fragment<matrix_a,16,16,32,__half,row_major>` = `unsigned int x[4]`；
+  `fragment<accumulator,16,16,32,float>` = 4 个 float；矩阵 b 同理 4 字。
+- `load_matrix_sync` **忽略 ldm**，按固定 swizzle 从 smem 取值，偏移值域 0..511：
+  - `off_row(row,col)`：`i=col>>4; c=col&15; r=row>>1; (i*256 + r/4*128) + ((r*32 + c*2 + (row&1) + i*64) & 127)`
+  - `off_col(row,col)`：`r=row>>1; (col>>2)*128 + (r&3)*32 + ((r>>3)^(col>>3))*16 + ((r>>2&1)^(col>>2&1))*8 + (col&3)*2 + (row&1)`
+- 一个 uint32 装"同列相邻两行"；gmem 相邻 half 是同一行的相邻列，**不能**
+  直接读 uint32 拼 A fragment。
+- 裸 mma 上限实测 **83.37 TFLOPS**（cuBLAS f16 4096³ 为 97）。
+- `__shfl_xor_sync` 可用；**`__any_sync` / `__ballot_sync` 不可用**（见否决项 5）。
+- 编译：`/usr/local/corex-5.0.0/bin/clang++ -x ivcore --cuda-path=$COREX_PATH -O2 -o x x.cu -L$COREX_PATH/lib -lcudart`，
+  运行需 `LD_LIBRARY_PATH=$COREX_PATH/lib`。
+- 占用：4 blocks/SM × 512 线程要求 regs ≤ 128（262144/(512*4)）；1024 线程
+  block 则 2 blocks/SM。
+
+### 结构（NW=16，当前最优且数值安全的版本）
+
+每个 block 1024 线程（16 个 warp），负责**整个头**的 512 行；grid=(1,bh)，
+K/V 每头只搬一次到 smem。SMEM = `(4096 + NWT*1024 + 512)*2` = 41984 B。
+每轮 32 个 key：8 次 mma 出 QK（s00/s01/s10/s11），softmax 就地写进本 warp
+的 P smem（`pw = psm + warp*1024`），10 次 mma 出 PV（o0..o7 + o8/o9 =
+`P@ones` 求分母），末尾按 `inv = 1/den` 归一化写回。
+
+每轮归约的写法（安全档，MR=1）：
+
+```cpp
+float mn = ml[g][q], corr = 1.f;
+float mx = fmaxf(x0, x1);
+for (int off = 1; off < 16; off <<= 1)
+    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+if (mx > mn) { corr = __expf(mn - mx); mn = mx; ml[g][q] = mx; }
+```
+
+### 实测（512×512×64，bh=256，reps=20）
+
+| 变体 | ms | GFLOPS |
+| --- | --- | --- |
+| GEMM 物化基线（当前包内实现） | 1.394 | 24653 |
+| TCU flash NW=8，MR=1 | 1.0188 | — |
+| TCU flash NW=8，MR=4 | 0.8639 | — |
+| **TCU flash NW=16，MR=1（唯一数值安全档，推荐）** | **0.8309** | **41350** |
+| TCU flash NW=16，MR=2 | 0.7322 | 46930 |
+| TCU flash NW=16，MR=4 | 0.6598 | 52070 |
+| TCU flash NW=16，不归约（数值错，仅作上限） | 0.4804 | 71520 |
+
+结论：NW=16 + 每轮归约 **0.8309 ms = 物化基线的 1.68×**；`none` 已达裸 mma
+上限的 86%，剩余差主要是 exp（MUFU）与 smem 搬运，且已大量重叠。
+注意：**同一编译单元内才有可比性**（多实例编译会整体变慢 10~20%）。
+
+### 已否决的方向（不要再试）
+
+1. **降频归约（MR=2/4）在真实值域下溢出**。整数 −2..2 输入下 err 仅 6.5e-4
+   看不出问题；换 `std=2.0` 的 f16 正态输入后 MR=2 有 `bad=38656/131072`、
+   MR=4 有 `bad=66048/131072`（inf/nan），MR=1 为 0。原因：`mn` 落后真实
+   max 时 `exp` 超过 half 上限 65504（对应 x < 11.09）。
+2. **双缓冲 K/V**：regs 119→131 超 128，占用掉到 3 blocks/SM，1.0733 ms 更慢。
+3. **gmem 直读 A fragment**：布局不符（见上），err 3.29。
+4. **K/V 预变换后 gmem 直读**：1.4955 ms，慢于 smem 重排。
+5. **`__any_sync` / `__ballot_sync` 门控归约**：`<<<1,64>>>` 探针里
+   `__any_sync` 正确、但 `__ballot_sync` 恒返回 0；放进大 block 后数值错
+   （err 1.68593）且更慢（0.9726 vs 0.9035 ms）。天数这套 vote intrinsic 不可用。
+
+### 明天接着做
+
+- [ ] **验证 Δ 平移**：exp 前统一减 `mn + Δ`（Δ≈4~6）。softmax 平移不变，
+      分子分母同比缩小可抵消，给降频归约留出 half 上界余量；代价是分母低端
+      项下溢（误差 ~3e-6，远低于 f16 精度）。若成立，MR=4 有望安全回到
+      0.66 ms（2.11×）。
+- [ ] 支持 mask（`[S,T]` 与 `[B,H,S,T]`）与 dropout（RNG 索引语义与现有
+      实现一致）。
+- [ ] 明确回退条件：S/T 非 32 倍数、D≠64 或 E≠64、f32 → 回退物化路径。
+- [ ] 接入 `iluvatar_af`：`_op_attention` 增加 f16 + D=E=64 + `T%32==0`
+      快路径，其余走现有物化实现。
+- [ ] `py -3.10 build.py` 重打包 + 远端 `install_hardware(zip, replace=True)`；
+      真机对拍 7 项 + 全量 conformance（必须 104 executed / 7 refused /
+      0 failed）。
+
+### 本轮随手记的坑
+
+13. **`err = 0` 可能是假象**：输出全 NaN/Inf 时 `fabs(nan - ref) > max` 恒
+    false。bench 里要单独数 `if (got != got) ++nbad;`，用 `bad=` 报告。
+14. 探测脚本放在 `%TEMP%` 并直接用 `ssh -p 11155 ubuntu@39.156.149.45`
+    + 密码推送执行；**用完即删**，结论只留在本文件。
+15. 清理进程曾把 `.git/index.lock` 移进回收站。不要用工具恢复；git 报锁错误
+    时直接删掉该锁文件即可。
