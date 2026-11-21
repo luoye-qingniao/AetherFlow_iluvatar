@@ -292,6 +292,9 @@ PV 侧成对读取未做：它需要每线程负责 2 个通道，partial 数翻
    `install_hardware("dist/iluvatar-0.1.0.zip", replace=True)`。**换机器、
    升级框架或改天数包都适用**：不要 rsync / sftp 已安装树，也不要只替换其中
    几个 `.py`，否则 manifest 校验失败的表现同上。
+   主框架 5.293 起，这种情况的报错会附带"硬件包目录存在但校验未通过：<原因>"，
+   并提示用 `install_hardware(..., replace=True)` 重装；看到这句就是覆盖安装，
+   不是没装。
 10. `runtime.py` **模块级定义了设备函数 `sum`**（同名覆盖内置），所以文件里
     任何模块级/方法内的 `sum(...)` 都会拿到设备算子，`pool_stats` 因此报
     `int + DeviceArray`。改用显式循环计块数。`max` / `min` 未被覆盖。
@@ -310,5 +313,6 @@ PV 侧成对读取未做：它需要每线程负责 2 个通道，partial 数翻
     `TypeError: CUDA 容器只支持切片（不降维）`。现在改为纯形状推导
     `_mask_target_shape` + `reshape`，`(1,1,S,T)`、`(1,1,1,S,T)` 都能直接传，
     调用方**不再需要**先 squeeze 成 `(S,T)`。
-    注意：天数包里装的是构建时打包的框架副本，旧包仍是缺陷版本；换机器或更新
-    后必须按坑 9 重打包 + `install_hardware(..., replace=True)` 重装。
+    注意：缺陷在 aetherflow 主框架里，硬件包 zip 只含 `iluvatar_af/`；天数机器
+    要把主框架更新到含 5.292 的提交，包侧未改动则不必重打包。若同时改了包内
+    代码，仍按坑 9 重打包 + `install_hardware(..., replace=True)` 重装。
