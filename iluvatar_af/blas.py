@@ -18,8 +18,9 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 
-# cublasOperation_t：CUBLAS_OP_N = 0
+# cublasOperation_t：CUBLAS_OP_N = 0、CUBLAS_OP_T = 1
 _CUBLAS_OP_N = 0
+_CUBLAS_OP_T = 1
 
 # cudaDataType：CUDA_R_32F = 0、CUDA_R_16F = 2
 _CUDA_R_16F = 2
@@ -241,6 +242,44 @@ class Cublas:
             ),
             "cublasGemmStridedBatchedEx",
         )
+
+    def _batched_nt(self, a, b, out, batch: int, stride_a: int, stride_b: int,
+                    stride_c: int, rtype: int) -> None:
+        """行主序 ``out[B, M, N] = a[B, M, K] @ b[B, N, K]^T``。
+
+        attention 的 QK^T 就是这一形态：Q 与 K 都是 ``(T, D)`` 行主序，直接
+        把 K 当"转置的右操作数"传即可，不需要先物化 K^T。列主序视角下
+        ``C_col(N, M) = b(N, K) * a(M, K)^T``，所以 A 位传 b、OP_T，B 位传
+        a、OP_N，ld 都是 K。
+        """
+        m, n = int(out.shape[-2]), int(out.shape[-1])
+        k = int(a.shape[-1])
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._check(
+            self._lib.cublasGemmStridedBatchedEx(
+                self._handle, _CUBLAS_OP_T, _CUBLAS_OP_N,
+                n, m, k,
+                ctypes.byref(alpha),
+                _ptr(b), rtype, k, stride_b,
+                _ptr(a), rtype, k, stride_a,
+                ctypes.byref(beta),
+                _ptr(out), rtype, n, stride_c,
+                batch,
+                _CUBLAS_COMPUTE_32F, _CUBLAS_GEMM_DEFAULT,
+            ),
+            "cublasGemmStridedBatchedEx",
+        )
+
+    def hgemm_batched_nt(self, a, b, out, batch: int,
+                         stride_a: int, stride_b: int, stride_c: int) -> None:
+        """f16 批量 GEMM，右操作数转置：``out = a @ b^T``。"""
+        self._batched_nt(a, b, out, batch, stride_a, stride_b, stride_c, _CUDA_R_16F)
+
+    def sgemm_batched_nt(self, a, b, out, batch: int,
+                         stride_a: int, stride_b: int, stride_c: int) -> None:
+        """f32 批量 GEMM，右操作数转置：``out = a @ b^T``。"""
+        self._batched_nt(a, b, out, batch, stride_a, stride_b, stride_c, _CUDA_R_32F)
 
     def close(self) -> None:
         if self._handle is not None:

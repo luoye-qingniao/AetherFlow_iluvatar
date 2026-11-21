@@ -26,7 +26,10 @@
 
 - 运行期图捕获（cudaGraph 兼容通道）只走保留式 arena：流捕获期间不允许
   ``cudaMalloc``，所以 ``reuse_memory=False`` 直接拒绝；
-- attention 的分块内核只接受 f32。
+- attention 不走共享模板的在线 softmax 内核，而是物化成 QK^T → softmax →
+  PV 三段（前两段与末段分别走 cuBLAS 与自写内核），f32/f16 都支持。
+  这是本包唯一覆盖 ``_op_attention`` 结构本身（而非仅内核源码）的地方，
+  原因与收益见 ``REMIND.md`` 的「GEMM 物化 attention」。
 
 准入判据不是"能跑通几个 demo"，而是 ``run_conformance`` 全绿——见 DESIGN 的 M4。
 """
@@ -41,6 +44,7 @@ import numpy as np
 from aetherflow.backends.base import BackendCapabilityError
 from aetherflow.backends.contracts import DeviceInfo
 from aetherflow.backends.device_backend import DeviceBackend, GPU_OPS
+from aetherflow.backends.device_shared import _mask_shared_over_heads, _mask_target_shape
 from . import codegen, runtime
 from .blas import Cublas
 from .memory import Arena
@@ -244,6 +248,161 @@ class IluvatarBackend(DeviceBackend):
                     f"天数后端无法加载 cuBLAS：{exc}"
                 ) from exc
         return self._blas
+
+    # ------------------------------------------------------------------
+    # attention：GEMM 物化路径
+    # ------------------------------------------------------------------
+
+    # 分数矩阵允许占用的上限。超过就走基类的分块 online-softmax 内核：物化
+    # 路径要一块 bh*S*T（softmax 就地归一化，不再额外要一份），2048² 以上会
+    # 开始吃掉可观的显存，而分块内核的显存是 O(bh*T)。
+    _ATTENTION_GEMM_MAX_BYTES = 256 << 20
+
+    def _op_attention(self, node, args, attrs):
+        """QK^T -> softmax -> PV 三段 GEMM，替代逐元素融合内核。
+
+        融合内核的瓶颈不是算力而是指令发射：每个分数要 1 次 load + 1 次
+        cvt + 1 次 FMA，标量路径在 MR-V100 上只有 ~0.5 TFLOPS。同一张卡的
+        cuBLAS 走 tensor core（f16 实测 ~97 TFLOPS），代价是分数矩阵要落一次
+        HBM。在 ``bh*S*T`` 不大时这笔往返远比发射便宜，所以这里把 attention
+        拆成两个 batched GEMM 加一次 softmax pass。
+
+        f32/f16 都走这条路；bf16 或超过显存阈值的形状退回基类实现。
+        """
+        cp = self.cp
+        q = args[0]
+        if q.ndim < 2 or q.dtype not in (cp.float16, cp.float32):
+            return super()._op_attention(node, args, attrs)
+        s_len = int(q.shape[-2])
+        d = int(q.shape[-1])
+        t_len = int(args[1].shape[-2])
+        e = int(args[2].shape[-1])
+        batch = tuple(int(x) for x in q.shape[:-2])
+        bh = int(np.prod(batch)) if batch else 1
+        itemsize = 2 if q.dtype == cp.float16 else 4
+        if (
+            s_len == 0 or d == 0 or t_len == 0 or e == 0
+            or bh > 65535
+            or bh * s_len * t_len * itemsize > self._ATTENTION_GEMM_MAX_BYTES
+        ):
+            return super()._op_attention(node, args, attrs)
+
+        out = cp.empty(batch + (s_len, e), dtype=q.dtype)
+        has_mask = 0
+        mask_shared = 0
+        mask = q
+        if len(args) > 3:
+            raw_mask = args[3]
+            if raw_mask.dtype != q.dtype:
+                raise BackendCapabilityError(
+                    f"attention 的 mask 必须与 q 同 dtype，收到 {raw_mask.dtype} 与 "
+                    f"{q.dtype}（节点 %{node.output.name}）"
+                )
+            original = tuple(raw_mask.shape)
+            target = _mask_target_shape(original, len(batch) + 2)
+            if target is None:
+                raise BackendCapabilityError(
+                    f"attention 的 mask 前导维必须是 1，得到 {original}"
+                    f"（节点 %{node.output.name}）"
+                )
+            if len(target) != len(original):
+                raw_mask = cp.ascontiguousarray(raw_mask).reshape(target)
+            if _mask_shared_over_heads(raw_mask.shape, s_len, t_len):
+                mask = cp.ascontiguousarray(raw_mask).reshape(s_len, t_len)
+                mask_shared = 1
+            else:
+                try:
+                    full = cp.broadcast_to(raw_mask, batch + (s_len, t_len))
+                except ValueError as exc:
+                    raise BackendCapabilityError(
+                        f"attention 的 mask 形状 {tuple(args[3].shape)} 无法广播到 "
+                        f"{batch + (s_len, t_len)}（节点 %{node.output.name}）"
+                    ) from exc
+                # 内核按行偏移寻址，展平后的 (bh*S, T) 与 (bh, S, T) 等价。
+                mask = cp.ascontiguousarray(full).reshape(bh * s_len, t_len)
+            has_mask = 1
+
+        q3 = cp.ascontiguousarray(q).reshape(bh, s_len, d)
+        k3 = cp.ascontiguousarray(args[1]).reshape(bh, t_len, d)
+        v3 = cp.ascontiguousarray(args[2]).reshape(bh, t_len, e)
+        scores = cp.empty((bh, s_len, t_len), dtype=q.dtype)
+
+        blas = self._cublas()
+        blas.set_stream(self.current_stream_ptr())
+        if q.dtype == cp.float16:
+            blas.hgemm_batched_nt(
+                q3, k3, scores, bh, s_len * d, t_len * d, s_len * t_len
+            )
+        else:
+            blas.sgemm_batched_nt(
+                q3, k3, scores, bh, s_len * d, t_len * d, s_len * t_len
+            )
+
+        scale = np.float32(float(attrs.get("scale", 1.0)))
+        p_drop = float(attrs.get("dropout", 0.0))
+        drop_scale = np.float32(1.0 / (1.0 - p_drop)) if p_drop > 0.0 else np.float32(1.0)
+        seed = np.uint64(int(attrs.get("seed", 0)) & 0xFFFFFFFFFFFFFFFF)
+        # 整行驻留寄存器：T 恰好是 64 的倍数且不超过 1024 时，每个 lane 持有
+        # 固定的 32 位字数，softmax 只需一遍 HBM 读（实测 497 GB/s，逼近
+        # 522 GB/s 的纯拷贝上限）。T = 2048 时 w/mw 两个数组各 32 个字会把
+        # 寄存器挤到 local memory，实测反而比两遍版本慢，所以上限停在 16。
+        np_reg = t_len // 64 if (q.dtype == cp.float16 and t_len % 64 == 0
+                                 and 0 < t_len // 64 <= 16) else 0
+        kernel = self._kernel(
+            ("attention_scores", self._kind(q), np_reg),
+            lambda: self.codegen.render(
+                self.codegen.attention_scores_source(np_reg), q.dtype),
+            "af_attention_scores",
+        )
+        # 一行一个 32 线程子组，不占 smem（行靠 L1/L2 二次命中）。
+        rows = bh * s_len
+        subwarps = 8
+        inv = cp.empty((rows,), dtype=cp.float32)
+        kernel(
+            (-(-rows // subwarps),),
+            (32 * subwarps,),
+            (
+                scores,
+                mask,
+                scores,
+                inv,
+                np.int64(rows),
+                np.int64(s_len),
+                np.int64(t_len),
+                scale,
+                np.float32(p_drop),
+                drop_scale,
+                seed,
+                np.int32(has_mask),
+                np.int32(mask_shared),
+            ),
+        )
+
+        if q.dtype == cp.float16:
+            blas.hgemm_batched(
+                scores, v3, out.reshape(bh, s_len, e),
+                bh, s_len * t_len, t_len * e, s_len * e,
+            )
+        else:
+            blas.sgemm_batched(
+                scores, v3, out.reshape(bh, s_len, e),
+                bh, s_len * t_len, t_len * e, s_len * e,
+            )
+
+        # (p/l) @ V == (p @ V)/l 逐行成立，所以分母的倒数放到最后乘一次：
+        # 作用在 bh*S*E 上，比在 bh*S*T 上做归一化少走一个数量级的显存。
+        per = 32 * subwarps
+        scale_fn = self._kernel(
+            ("attention_rescale", self._kind(q)),
+            lambda: self.codegen.render(self.codegen.attention_rescale_source(), q.dtype),
+            "af_attention_rescale",
+        )
+        scale_fn(
+            (min(4096, max(1, -(-rows // subwarps))),),
+            (per,),
+            (out, inv, np.int64(rows), np.int64(e)),
+        )
+        return out
 
     # ------------------------------------------------------------------
     # 运行期计划

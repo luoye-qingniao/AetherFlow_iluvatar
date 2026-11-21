@@ -101,9 +101,12 @@ password: K4QgJolw
 - [x] 性能第一轮：内核句柄缓存 + 设备内存池 + launcher 热路径
       （见"性能优化（2026-11-21）"一节）
 - [x] 性能实测：`CONV_IMPLS` 的大规模形状对比（tiled/grouped 慢 23×，不推荐）
-- [x] attention 内核重写：天数包内覆盖 `attention_source`，子组协作 + 成对读取，
-      512×512×64 从 18.1 ms（123 GFLOPS）降到 4.2 ms（509 GFLOPS），
-      全量 conformance 仍 PASS（见"attention 内核重写"一节）
+- [x] attention 内核重写（第一轮）：天数包内覆盖 `attention_source`，子组协作 +
+      成对读取，512×512×64 从 18.1 ms（123 GFLOPS）降到 4.2 ms（509 GFLOPS）
+- [x] attention GEMM 物化（第二轮，当前实现）：`_op_attention` 改为
+      QK^T → softmax → PV → rescale，512×512×64 降到 **1.394 ms /
+      24653 GFLOPS**（18.1 ms 的 13×，已达 522 GB/s 硬下限的 87.5%），
+      对拍 7 项 + 全量 conformance 仍 PASS（见"GEMM 物化 attention"一节）
 
 ## 训练层接入（框架侧唯一改动）
 
@@ -200,9 +203,10 @@ CPU 开销，且 capture 本身有额外分支。池在基准结束时 38.9 MB /
 - **attention 是唯一的大头**，且与形状无关地停在 ~123 GFLOPS：共享模板
   `ATTENTION_SRC` 是"一行一个 block、每线程串行扫 D 维算一个 key 的 dot"，
   K 的读取步长 128 B、完全不合并；每 chunk 还有两次 `block_reduce`。
-  这是 CUDA 模板的固有结构，不是天数特有缺陷。**已在天数包内覆盖
-  `attention_source` 重写**：4.2–7.6 ms / 509–568 GFLOPS（4.3–5.5×），
-  RNG 索引、mask 形态与在线 softmax 顺序逐项保持，详见下一小节。
+  这是 CUDA 模板的固有结构，不是天数特有缺陷。两轮优化后最终改为
+  **GEMM 物化**（QK^T → softmax → PV → rescale），512×512×64 从 18.1 ms
+  （123 GFLOPS）降到 **1.394 ms（24653 GFLOPS，13×）**，见「GEMM 物化
+  attention」一节；中间的融合内核（4.22 ms / 509 GFLOPS）作为历史保留。
 - **conv 的 tiled/grouped 实现慢 23×**（f32 8×64×112² 3×3：auto/im2col ≈5.55 ms，
   implicit 18.3 ms，tiled/grouped 129 ms），`auto` 不选它们是对的；
   `CONV_AUTO_IMPLICIT=False` 保持。小通道 C=3 时 `auto` 选了 tiled（0.827 ms）
@@ -211,7 +215,118 @@ CPU 开销，且 capture 本身有额外分支。池在基准结束时 38.9 MB /
   会改变 Adam 的数值轨迹，破坏"与主机态逐位对齐"的验收基线。风险大于收益，
   除非另建一套宽松的对齐判据。
 
-### attention 内核重写（2026-11-21）
+### GEMM 物化 attention（2026-11-21，当前实现）
+
+上一节的融合内核把 QK/PV 都手写在同一个 kernel 里，最终停在 4.22 ms /
+509 GFLOPS。它已经不是带宽或 barrier 受限，而是**指令发射受限**：每个分数
+需要 1 次 load + 1 次 cvt + 1 次 FMA，标量路径在 MR-V100 上封顶约 0.5 TFLOPS。
+同一张卡 cuBLAS 的 f16 走 tensor core，实测 97 TFLOPS——差 190 倍。
+
+所以改成 **materialized**（`IluvatarBackend._op_attention` 覆盖，结构级改动）：
+
+| # | 步骤 | 实现 | 代价（bh=256, S=T=512, D=E=64, f16） |
+| --- | --- | --- | --- |
+| 1 | `P = QK^T` | `cublasGemmStridedBatchedEx` | 0.398 ms / 43147 GFLOPS / 420 GB/s |
+| 2 | `P = softmax(P*scale + mask) [* drop]`，同时写 `inv[r]=1/l` | 自写内核，就地 | 0.549 ms / **489 GB/s** |
+| 3 | `O = PV` | `cublasGemmStridedBatchedEx` | 0.418 ms / 41118 GFLOPS / 400 GB/s |
+| 4 | `O *= inv[r]` | 自写内核 `af_attention_rescale` | 0.088 ms / 381 GB/s |
+| | **合计** | | **1.394 ms / 24653 GFLOPS** |
+
+首版（softmax 三遍、rescale 每元素 64 位除法）2.820 ms，上一版 1.573 ms，
+当前 1.394 ms；相对融合内核的 4.22 ms 是 3.0×，相对原共享模板的 18.1 ms
+是 13×。
+
+**cuBLAS 的 NT 技巧**：框架里三个张量都是行主序 `[M,N] = a[M,K] @ b[N,K]^T`。
+列主序下这等价于 `C^T = B^T A^T`，所以调用是
+`cublasGemmStridedBatchedEx(OP_T, OP_N, n, m, k, A=b, lda=k, B=a, ldb=k,
+C, ldc=n)`——OP 与 A/B 交换位置，其余原样。f32 走 `Sgemm *`，f16 走
+`cublasGemmEx` + `CUDA_R_32F` 累加（与 `blas.py` 既有条目同一约定）。
+
+**归一化挪到输出**：`(p/l) @ V == (p @ V)/l`，softmax 只写未归一化的 p，
+每行顺手写一个 `inv[r] = 1/l`，最后在 `bh*S*E`（比分数矩阵小 `T/E` 倍）上
+乘一次。省掉整整一遍 134 MB 的读写，同时让 dropout 的写法更干净（只乘分子）。
+
+**softmax 内核的三版**（同一个 134 MB 原地读写，都是 32 线程子组一行、
+不用 smem，行靠 L1/L2 二次命中）：
+
+| 版本 | 512×512 | 2048×2048 | 说明 |
+| --- | --- | --- | --- |
+| 早期 smem 版 | 130 GB/s | 31 GB/s | `smem[B][T]` 中转，T=2048 时 smem 分块退化 |
+| warp-per-row 两遍 | 390 GB/s | 266 GB/s | 第一遍 max、第二遍 exp+存；两遍都要回 HBM |
+| **寄存器驻留单遍** | **489 GB/s** | 266 GB/s（T=2048 仍用两遍） | `AF_NP_REG` 见下 |
+
+`AF_NP_REG = T/64`：每个 lane 持有 `T/64` 个 32 位字（f16 成对），第一遍读入
+`w[]` 同时求出 max，第二遍直接从寄存器解包 exp 并成对写回，HBM 只读一次。
+上限 **16**（T ≤ 1024）：T=2048 时 `w[]`/`mw[]` 各 32 字溢出到 local memory，
+实测 0.326 ms / 206 GB/s，反而慢于两遍版的 0.245 ms / 274 GB/s。
+`np_reg` 进 kernel key，两种版本各自缓存。
+
+**rescale 的坑**：旧版按元素启动，每元素一次 `(i*2)/E` 的 64 位整数除法，
+只有 249 GB/s。改成"一个 32 线程子组一行、行号即 `inv` 下标"后，行内偏移
+全部落在 32 位常量里，0.135 → **0.079–0.088 ms（381–423 GB/s）**。
+
+**带宽账（硬下限）**：`bh=256, S=T=512, D=E=64` 总流量 637 MB
+（QK 写 134 + f16 读 33.5；softmax 读 134 + 写 134；PV 读 134 + V 16.8 +
+写 16.8；rescale 33.5）。实测带宽上限（见下表）取 **522 GB/s**，
+下限 ≈ **1.22 ms**。当前 1.394 ms = 下限的 **87.5%**；softmax 自身
+489/522 = 94%。
+
+带宽上限用 134 MB 行数据探针实测（f16，`copy32` 每 lane 32 位成对拷贝）：
+
+| 访问形态 | 带宽 |
+| --- | --- |
+| `copy32`（32 位）T=512 / T=2048 | **522 / 427 GB/s** |
+| `copy128`（16 B 向量） | 402 / 353 GB/s |
+| 纯 f16↔f32 转换 | 369 GB/s |
+| 加 `expf` | 368 GB/s |
+| 两遍（max 预扫 + 第二遍） | 357 GB/s |
+| 子组一行 + 32 位读两 f16 + 无 smem（单遍） | **464 GB/s** |
+
+结论：**4 字节访问是最优点**，向量化在 MR-V100 上反而更差；这也是所有内核
+统一用 32 位成对存取的理由。（`rt.copy_async(..., kind=1, ...)` 是 H2D，
+不是 D2D，用它测带宽无效。）
+
+**其他形状**（同版本）：
+
+| 形状（bh, S, T, D, E） | 耗时 | 算力 |
+| --- | --- | --- |
+| 256, 512, 512, 64, 64 | 1.394 ms | 24653 GFLOPS |
+| 256, 512, 512, 128, 128 | 1.546 ms | **44451 GFLOPS** |
+| 32, 512, 512, 64, 64 | 0.250 ms | 17167 GFLOPS |
+| 4, 2048, 2048, 64, 64 | 0.479 ms | 17922 GFLOPS |
+
+小批（bh=32）与长序列（2048²）掉到 17–18 TFLOPS，原因不同：前者是 batched
+GEMM 批次太小、启动与尾块占比上升；后者是 softmax 退回两遍（266 GB/s），
+分数矩阵 4×2048²×2 B 也让 GEMM 的有效读写效率下降。
+
+**显存阈值**：物化路径要一块 `bh*S*T*itemsize` 的分数矩阵
+（`_ATTENTION_GEMM_MAX_BYTES = 256 MiB`，softmax 就地做，不再额外要一份）。
+超过阈值或 dtype 不是 f32/f16（如 bf16）时退回基类的分块 online-softmax 内核，
+显存从 O(bh*S*T) 降到 O(bh*T)。
+
+**已否决、不要重试**：
+
+1. **自写 tensor-core flash**：`#include <mma.h>` 在 ivcore11 上只有 int8
+   （`I8M16N16K16/K32`）与 f32（`F32M16N16K8`，仅 `__ivcore20__`）的 fragment
+   特化；所有 f16 形状都报 `implicit instantiation of undefined template`
+   （`iluvatar_mma.h:146`）。强行绕开模板、按 4 种 16/32 形状硬写，编译能过
+   但结果全错（block=64 有数但错，block=32 出 nan）。**ivcore11 没有可用的
+   f16 tensor core API，这条路在硬件层就断了。**
+2. **按 bh 切片做 L2 分片**：bh=32 的单片只要 0.250 ms，看起来 ×8 还能更快，
+   但小批 GEMM 效率下降 + 4 次启动开销把收益全部吃掉，实测 2.0 ms。
+3. **用 `|q|*max|k|` 上界替代每行 max**：省掉 max 预扫，但 Cauchy-Schwarz 上界
+   太松，f16 下 `exp` 会下溢，数值不安全。
+4. **T=2048 也开 `AF_NP_REG=32`**：见上，溢出 local memory 反而更慢。
+
+**正确性**：对拍 7 项全 PASS（f16 plain 1.620e-03、mask(1,1,S,T) 1.173e-03、
+mask(2,2,S,T) 1.094e-03、cross-head 8.646e-04、f32 plain 7.153e-07、
+f32 mask 5.960e-07、dropout 逐位 0.0009765625 = 1/1024 量化步长）；
+全量 conformance **104 executed / 7 refused / 0 failed，PASS**。
+
+### attention 融合内核重写（2026-11-21，历史，已被上一节替代）
+
+> 保留作为「指令发射上限」的量化证据：这条路线做到 509 GFLOPS 就到顶了，
+> 而 cuBLAS 的 tensor core 是 97 TFLOPS，两者不在一个量级。以下内容不再维护。
 
 共享模板 `ATTENTION_SRC` 的结构是"一行 Q 一个 block、每线程串行扫 D 维算一个
 key 的 dot"，K 的读取步长 `D*sizeof(T)`，warp 内完全不合并，所以任何形状都停在

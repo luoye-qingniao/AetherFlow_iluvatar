@@ -87,9 +87,7 @@ __device__ __forceinline__ float af_add_h(unsigned short* p, float v) {
 # `__shfl_down_sync` 的 width 参数负责分段，因此同一份源码在两种 warp 宽度
 # 下都成立。**不要**把它换成裸的 `__shfl_down_sync(v, off)`——那次调用默认
 # 跨整个 warp（天数上是 64），会把多个 key 的和串到一起。
-_ILUVATAR_ATTENTION_SRC = (
-    "%PRELUDE%"
-    + r"""
+_ILUVATAR_ATTN_HELPERS = r"""
 // Block-wide max/sum with a warp-level pre-pass.
 //
 // The shared `block_reduce_max` / `block_reduce_sum` are pure smem trees: on a
@@ -140,7 +138,9 @@ __device__ __forceinline__ unsigned long long attention_rand(unsigned long long 
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
     return z ^ (z >> 31);
 }
+"""
 
+_ILUVATAR_ATTENTION_SRC = "%PRELUDE%" + _ILUVATAR_ATTN_HELPERS + r"""
 // Dot product against a Q fragment already held in registers.
 //
 // W is the unroll width and is picked from nq so that a narrow row (D=8 gives
@@ -446,9 +446,271 @@ extern "C" __global__ void attention_fwd(const %T%* __restrict__ q,
     }
 }
 """
-)
 
-__all__ = ["render", "cast_fn", "attention_source"]
+# 分数矩阵归一化内核：把 QK^T 的产物就地变成 P（softmax + mask + dropout）。
+#
+# 走 GEMM 的 attention 路径需要一次显式的 softmax pass，而共享的 softmax 内核
+# 不认识 mask / dropout / attention 的 seed 约定，所以这里单独写一份。语义与
+# 融合内核逐项对齐：**分母只累加 dropout 之前的 p**，dropout 只作用在写出的
+# 权重上（含 1/(1-p) 缩放）；RNG 下标仍是 (bh*S + s)*T + t，保证同一 seed 下
+# 与融合内核给出相同的 mask。
+#
+# 一行一个 32 线程子组（sub-warp），不占 smem、两遍读同一行。
+#
+# 三版实测（MR-V100，134 MB 行数据，见 REMIND 的带宽探针）：
+#   - "一块一行 + smem 缓存"：130 GB/s。每块只有 2 KB 数据，4 次
+#     __syncthreads + 归约开销把带宽吃光；smem 版本还限制了每块 32 KB 的
+#     行缓存，T=2048 时只剩 6 个子组在跑，掉到 31 GB/s。
+#   - "子组一行、标量逐元素、无 smem"：369 GB/s（纯拷贝上限 522 GB/s）。
+#   - "子组一行、一次 32 位读两个 f16、无 smem"：464 GB/s。
+# 所以这里用最后一版：一次 load 覆盖 32 lane × 4 B = 128 B，正好一条 cache
+# line；第二遍重读靠 L1/L2 命中（每行只有 1~4 KB，刚读过），HBM 上仍是一次
+# 读 + 一次写。
+#
+# `out` 允许与 `sc` 同址（原地归一化）：每个下标只在自己的那一次迭代里
+# 先读后写，迭代之间下标不相交，所以不会读到被改过的值。
+#
+# 归约宽度取 32 而不是 `warpSize`：天数 warp 是 64，`__shfl_*_sync` 的 width
+# 参数负责分段，32 是两种 warp 宽度下的公共子宽度（与融合内核同一约定）。
+# `__shfl_down_sync` 只保证结果落在 0 号 lane，必须再用一次 `__shfl_sync`
+# 广播回整组——漏掉这步会让 1~31 号 lane 用着残缺的 max/sum 继续算。
+_ILUVATAR_SCORES_SRC = "%PRELUDE%" + _ILUVATAR_ATTN_HELPERS + r"""
+// AF_NP_REG > 0 表示"整行驻留寄存器"的特化：行宽 T 恰好等于 64 * AF_NP_REG，
+// 于是每个 lane 固定持有 AF_NP_REG 个 32 位字（= 2*AF_NP_REG 个 f16），
+// 第一遍读进来的字直接留在寄存器里，第二遍不再碰显存。
+//
+// 两遍版本在 T <= 1024 时第二遍靠 L1 命中，HBM 上仍是一次读 + 一次写，但
+// 省不掉第二遍的 L1 流量与地址计算；T = 2048 时一行 4 KB，多块并发把这个
+// 工作集挤出 L1，第二遍变成真的 HBM 读，实测有效带宽从 390 掉到 276 GB/s。
+// 寄存器版把两种情况都压到"一次 HBM 读 + 一次 HBM 写"。
+//
+// 上限 16 是实测的寄存器预算：AF_NP_REG = 16 时 w/mw 两个数组各 16 个字，
+// 仍然全部留在寄存器里（T = 1024 实测 497 GB/s）；再往上（T = 2048）会溢出
+// 到 local memory，实测 206 GB/s，反而比两遍版本（274 GB/s）更慢。
+#define AF_NP_REG %NP%
+
+__device__ __forceinline__ float af_sub_max(float v) {
+    for (int off = 16; off > 0; off >>= 1) {
+        const float o = __shfl_down_sync(0xFFFFFFFFu, v, off, 32);
+        v = v > o ? v : o;
+    }
+    return __shfl_sync(0xFFFFFFFFu, v, 0, 32);
+}
+
+__device__ __forceinline__ float af_sub_sum(float v) {
+    for (int off = 16; off > 0; off >>= 1) {
+        v += __shfl_down_sync(0xFFFFFFFFu, v, off, 32);
+    }
+    return __shfl_sync(0xFFFFFFFFu, v, 0, 32);
+}
+
+// dropout 的 0/1 判定，与融合内核同一约定（同一 seed 逐位相同）。
+__device__ __forceinline__ float af_drop_w(float p, float p_drop, float drop_scale,
+                                           unsigned long long seed, long long idx) {
+    const unsigned long long z = attention_rand(seed, idx);
+    const float u = (float)((z >> 40) & 0xFFFFFFULL) * (1.0f / 16777216.0f);
+    return (u >= p_drop) ? p * drop_scale : 0.f;
+}
+
+extern "C" __global__ void af_attention_scores(
+    const %T%* __restrict__ sc,
+    const %T%* __restrict__ mask,
+    %T%* __restrict__ out,
+    float* __restrict__ inv_out,
+    long long rows, long long S, long long T, float scale,
+    float p_drop, float drop_scale, unsigned long long seed,
+    int has_mask, int mask_shared) {
+  const int lane = threadIdx.x & 31;
+  const long long r = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (r >= rows) { return; }
+
+  const %T%* src = sc + r * T;
+  const %T%* mrow = mask + (mask_shared ? (r % S) : r) * T;
+  %T%* dst = out + r * T;
+#if AF_NP_REG > 0
+  // 整行驻留寄存器（host 侧已保证 sizeof(T) == 2 且 T == 64 * AF_NP_REG）。
+  unsigned int w[AF_NP_REG];
+  unsigned int mw[AF_NP_REG];
+  float mxl = -3.402823466e+38f;
+#pragma unroll
+  for (int i = 0; i < AF_NP_REG; ++i) {
+    const long long t0 = ((long long)i * 32 + lane) * 2;
+    const unsigned int wi = *(const unsigned int*)(const void*)(src + t0);
+    w[i] = wi;
+    float v0 = %LD%((unsigned short)(wi & 0xFFFFu)) * scale;
+    float v1 = %LD%((unsigned short)(wi >> 16)) * scale;
+    if (has_mask) {
+      const unsigned int mi = *(const unsigned int*)(const void*)(mrow + t0);
+      mw[i] = mi;
+      v0 += %LD%((unsigned short)(mi & 0xFFFFu));
+      v1 += %LD%((unsigned short)(mi >> 16));
+    }
+    mxl = v0 > mxl ? v0 : mxl;
+    mxl = v1 > mxl ? v1 : mxl;
+  }
+  const float mxr = af_sub_max(mxl);
+  float sumr = 0.f;
+#pragma unroll
+  for (int i = 0; i < AF_NP_REG; ++i) {
+    const long long t0 = ((long long)i * 32 + lane) * 2;
+    const unsigned int wi = w[i];
+    float v0 = %LD%((unsigned short)(wi & 0xFFFFu)) * scale;
+    float v1 = %LD%((unsigned short)(wi >> 16)) * scale;
+    if (has_mask) {
+      const unsigned int mi = mw[i];
+      v0 += %LD%((unsigned short)(mi & 0xFFFFu));
+      v1 += %LD%((unsigned short)(mi >> 16));
+    }
+    const float p0 = expf(v0 - mxr);
+    const float p1 = expf(v1 - mxr);
+    float o0 = p0;
+    float o1 = p1;
+    if (p_drop > 0.f) {
+      const long long base = r * T + t0;
+      o0 = af_drop_w(p0, p_drop, drop_scale, seed, base);
+      o1 = af_drop_w(p1, p_drop, drop_scale, seed, base + 1);
+    }
+    sumr += p0 + p1;
+    *(unsigned int*)(void*)(dst + t0) =
+        (unsigned int)%ST%(o0) | ((unsigned int)%ST%(o1) << 16);
+  }
+  sumr = af_sub_sum(sumr);
+  if (lane == 0) { inv_out[r] = sumr > 0.f ? 1.f / sumr : 0.f; }
+#else
+  const long long n2 = T >> 1;
+  // 成对读要求行首 4 字节对齐（T 为偶数即可，cudaMalloc 保证基址对齐）且
+  // 存储宽度为 16 位。f32 或奇数 T 走标量路径，语义完全一致。
+  const bool pair = sizeof(%T%) == 2 && ((T & 1) == 0);
+
+  float mx = -3.402823466e+38f;
+  if (pair) {
+    for (long long i = lane; i < n2; i += 32) {
+      const unsigned int w = *(const unsigned int*)(const void*)(src + i * 2);
+      float v0 = %LD%((unsigned short)(w & 0xFFFFu)) * scale;
+      float v1 = %LD%((unsigned short)(w >> 16)) * scale;
+      if (has_mask) {
+        const unsigned int mw = *(const unsigned int*)(const void*)(mrow + i * 2);
+        v0 += %LD%((unsigned short)(mw & 0xFFFFu));
+        v1 += %LD%((unsigned short)(mw >> 16));
+      }
+      mx = v0 > mx ? v0 : mx;
+      mx = v1 > mx ? v1 : mx;
+    }
+  } else {
+    for (long long t = lane; t < T; t += 32) {
+      float v = %LD%(src[t]) * scale;
+      if (has_mask) { v += %LD%(mrow[t]); }
+      mx = v > mx ? v : mx;
+    }
+  }
+  mx = af_sub_max(mx);
+
+  // 分母只累加 dropout 之前的 p；dropout 只作用在写出的权重上。
+  float sum = 0.f;
+  if (pair) {
+    for (long long i = lane; i < n2; i += 32) {
+      const long long t0 = i * 2;
+      const unsigned int w = *(const unsigned int*)(const void*)(src + t0);
+      float v0 = %LD%((unsigned short)(w & 0xFFFFu)) * scale;
+      float v1 = %LD%((unsigned short)(w >> 16)) * scale;
+      if (has_mask) {
+        const unsigned int mw = *(const unsigned int*)(const void*)(mrow + t0);
+        v0 += %LD%((unsigned short)(mw & 0xFFFFu));
+        v1 += %LD%((unsigned short)(mw >> 16));
+      }
+      const float p0 = expf(v0 - mx);
+      const float p1 = expf(v1 - mx);
+      float o0 = p0;
+      float o1 = p1;
+      if (p_drop > 0.f) {
+        const long long base = r * T + t0;
+        o0 = af_drop_w(p0, p_drop, drop_scale, seed, base);
+        o1 = af_drop_w(p1, p_drop, drop_scale, seed, base + 1);
+      }
+      sum += p0 + p1;
+      const unsigned int o = (unsigned int)%ST%(o0) |
+                             ((unsigned int)%ST%(o1) << 16);
+      *(unsigned int*)(void*)(dst + t0) = o;
+    }
+  } else {
+    for (long long t = lane; t < T; t += 32) {
+      float v = %LD%(src[t]) * scale;
+      if (has_mask) { v += %LD%(mrow[t]); }
+      const float p = expf(v - mx);
+      float w = p;
+      if (p_drop > 0.f) {
+        w = af_drop_w(p, p_drop, drop_scale, seed, r * T + t);
+      }
+      sum += p;
+      dst[t] = %ST%(w);
+    }
+  }
+  sum = af_sub_sum(sum);
+
+  // 归一化不在这里做：那要给整行再走一遍读+写。分母的倒数交给输出缩放内核，
+  // 那里只有 bh*S*E 个元素（E 通常远小于 T），而且 f16 下把 [0,1] 的未归一化
+  // 权重存进 HBM、再乘 1/l，比直接存 p/l 更不容易落进次正规数。
+  if (lane == 0) { inv_out[r] = sum > 0.f ? 1.f / sum : 0.f; }
+#endif
+}
+"""
+
+# 输出行缩放：out[r, :] *= inv[r]。
+#
+# 分数矩阵的 softmax 只写未归一化权重，分母的倒数在这里一次性作用到输出上。
+# 语义等价因为 (p/l) @ V == (p @ V)/l 对每行成立；代价是 bh*S*E 的读+写，
+# 比在 bh*S*T 上多走一遍小一个数量级的量级。
+_ILUVATAR_RESCALE_SRC = "%PRELUDE%" + r"""
+extern "C" __global__ void af_attention_rescale(
+    %T%* __restrict__ out,
+    const float* __restrict__ inv,
+    long long rows, long long E) {
+  // 一个 32 线程子组负责一行，行号就是 inv 的下标。
+  //
+  // 早先的写法是扁平的 grid-stride 循环，每个元素用 ``i / E`` 反算行号：
+  // 那是每元素一次 64 位整数除法（E 是运行时值，编译器消不掉），在
+  // bh*S*E = 8.4M 个元素上实测只有 249 GB/s。按行分工后行号直接来自
+  // 子组编号，除法整条消失，inv 每行只读一次（跨 lane 广播，命中 L1）。
+  const int lane = threadIdx.x & 31;
+  const int nsub = blockDim.x >> 5;
+  const long long stride = (long long)gridDim.x * nsub;
+  const long long start = (long long)blockIdx.x * nsub + (threadIdx.x >> 5);
+  const bool pair = sizeof(%T%) == 2 && ((E & 1) == 0);
+  for (long long r = start; r < rows; r += stride) {
+    const float s = inv[r];
+    %T%* row = out + r * E;
+    if (pair) {
+      const long long e2 = E >> 1;
+      for (long long i = lane; i < e2; i += 32) {
+        const unsigned int w = *(const unsigned int*)(const void*)(row + i * 2);
+        const float v0 = %LD%((unsigned short)(w & 0xFFFFu)) * s;
+        const float v1 = %LD%((unsigned short)(w >> 16)) * s;
+        *(unsigned int*)(void*)(row + i * 2) =
+            (unsigned int)%ST%(v0) | ((unsigned int)%ST%(v1) << 16);
+      }
+    } else {
+      for (long long i = lane; i < E; i += 32) {
+        row[i] = %ST%(%LD%(row[i]) * s);
+      }
+    }
+  }
+}
+"""
+
+
+def attention_scores_source(np_reg: int = 0):
+    """GEMM 路径的 softmax+mask+dropout 内核源码。
+
+    ``np_reg`` 为 0 时生成两遍版本（先扫 max，再读一遍写 exp）；大于 0 时
+    生成"整行驻留寄存器"的特化版本，要求调用方保证 ``T == 64 * np_reg``
+    且存储宽度为 16 位。寄存器版把 HBM 读从两遍降到一遍。
+    """
+    return _ILUVATAR_SCORES_SRC.replace("%NP%", str(int(np_reg)))
+
+
+def attention_rescale_source():
+    """GEMM 路径的输出行缩放内核源码。"""
+    return _ILUVATAR_RESCALE_SRC
 
 
 def attention_source():
@@ -483,3 +745,12 @@ def cast_fn(src, dst) -> str:
 def __getattr__(name: str):
     """未定义的常量/函数一律来自 CUDA 侧的模板库（单一事实来源）。"""
     return getattr(_cuda, name)
+
+
+__all__ = [
+    "render",
+    "cast_fn",
+    "attention_source",
+    "attention_scores_source",
+    "attention_rescale_source",
+]
