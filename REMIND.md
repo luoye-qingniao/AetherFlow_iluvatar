@@ -101,8 +101,9 @@ password: K4QgJolw
 - [x] 性能第一轮：内核句柄缓存 + 设备内存池 + launcher 热路径
       （见"性能优化（2026-11-21）"一节）
 - [x] 性能实测：`CONV_IMPLS` 的大规模形状对比（tiled/grouped 慢 23×，不推荐）
-- [ ] attention 内核：共享模板"一行一个 block + K 读取不合并"，实测 ~123 GFLOPS，
-      拟在天数包内另写一版（见"性能优化"一节的结论）
+- [x] attention 内核重写：天数包内覆盖 `attention_source`，子组协作 + 成对读取，
+      512×512×64 从 18.1 ms（123 GFLOPS）降到 4.2 ms（509 GFLOPS），
+      全量 conformance 仍 PASS（见"attention 内核重写"一节）
 
 ## 训练层接入（框架侧唯一改动）
 
@@ -199,9 +200,9 @@ CPU 开销，且 capture 本身有额外分支。池在基准结束时 38.9 MB /
 - **attention 是唯一的大头**，且与形状无关地停在 ~123 GFLOPS：共享模板
   `ATTENTION_SRC` 是"一行一个 block、每线程串行扫 D 维算一个 key 的 dot"，
   K 的读取步长 128 B、完全不合并；每 chunk 还有两次 `block_reduce`。
-  这是 CUDA 模板的固有结构，不是天数特有缺陷。收益预期 5–10×，做法是在天数
-  包内覆盖 `attention_source`（warp=64 下按 D 拆 warp + shuffle 归约），
-  约束是保持 mask/dropout 的 RNG 索引仍是 `(bh*S+s)*T+t`，且保证与现结果位级一致。
+  这是 CUDA 模板的固有结构，不是天数特有缺陷。**已在天数包内覆盖
+  `attention_source` 重写**：4.2–7.6 ms / 509–568 GFLOPS（4.3–5.5×），
+  RNG 索引、mask 形态与在线 softmax 顺序逐项保持，详见下一小节。
 - **conv 的 tiled/grouped 实现慢 23×**（f32 8×64×112² 3×3：auto/im2col ≈5.55 ms，
   implicit 18.3 ms，tiled/grouped 129 ms），`auto` 不选它们是对的；
   `CONV_AUTO_IMPLICIT=False` 保持。小通道 C=3 时 `auto` 选了 tiled（0.827 ms）
@@ -209,6 +210,52 @@ CPU 开销，且 capture 本身有额外分支。池在基准结束时 38.9 MB /
 - **未做 Adam 融合**（26 次逐元素 launch → 2 次，训练步还能再省约 40%）：
   会改变 Adam 的数值轨迹，破坏"与主机态逐位对齐"的验收基线。风险大于收益，
   除非另建一套宽松的对齐判据。
+
+### attention 内核重写（2026-11-21）
+
+共享模板 `ATTENTION_SRC` 的结构是"一行 Q 一个 block、每线程串行扫 D 维算一个
+key 的 dot"，K 的读取步长 `D*sizeof(T)`，warp 内完全不合并，所以任何形状都停在
+~123 GFLOPS。天数包改为在 `iluvatar_af/codegen.py::_ILUVATAR_ATTENTION_SRC` 里
+覆盖 `attention_source()`，kernel 参数顺序、grid `(S,BH)`、block、smem 全部沿用
+框架，语义逐项保持（在线 softmax 的 m/l/corr 顺序、dropout RNG 索引
+`(bh*S+s)*T+t`、dropout 只乘分子、f16 只舍入存取）。
+
+逐项改动与实测（f16，32 heads，`execute_device`）：
+
+| 改动 | 512×512×64 | 说明 |
+| --- | --- | --- |
+| 原内核 | 18.1 ms / 123 GFLOPS | baseline |
+| QK 子组协作（SG=8，lane 分块 CE=8） | 7.86 ms | 同一条 load 覆盖连续 16 B，组内 shuffle 归约 |
+| warp 级块归约（2 barrier 取代 9） | 7.81 ms | barrier 从来不是瓶颈（20→6 只值 0.6%） |
+| PV 分片（nparts 组 + 折 partial） | 7.84 ms | 原实现让 3/4 的 block 空转 |
+| SG 改为模板参数并按 D 分档（D≥96→16） | 5.66 ms | 运行时 SG 会让 `__shfl_down_sync` 的 width 与 `threadIdx.x/SG` 失去常量折叠 |
+| Q 片段寄存器化（`af_dot_reg<2/4/8>`） | 4.42 ms | 内层每元素一次 load 而非两次；窄 D 必须分档，否则 8 宽死展开让 D=8 掉 30% |
+| 指针 + int 步长（QK 内层与 PV） | 4.56 ms（再经 Q 寄存器化到 4.42） | 消掉每次访问的 64 位乘加 |
+| **K 成对 32 位读取（`af_ld2`）** | **4.22 ms / 509 GFLOPS** | load 指令数减半；要求 `D % (2*SG) == 0` 保证 4 字节对齐 |
+
+其余形状（同一版本）：2048×2048×64 = 66.7 ms / 515 GFLOPS（原 2×2 heads 40.3 ms，
+折算 4.8×），512×512×128 = 7.56 ms / 568 GFLOPS（原 41.6 ms，5.5×）。
+诊断形状：QK-only（D=64,E=8）3.25 ms、QK-only（D=128,E=8）5.80 ms、
+PV-only（D=8,E=64）2.96 ms——QK 与 PV 都已接近"每元素 1 load + 1 cvt + 1 FMA"
+的发射上限。
+
+试过但**没有收益**（不要再走一遍）：
+
+- `__expf` 替换 `expf`：5.66 → 5.63 ms，噪声内。
+- 把块归约从 20 个 barrier 压到 6 个：0.6%。
+- 把展开宽度 W 或 qv 数组长度做成模板参数、按 D 在调用点分档：qv 数组长度随 W
+  变化时编译器内联出十几个签名，所有形状慢 29%；数组固定 8 而只把 W 模板化时
+  天数编译器在某些实例上直接崩溃（见坑 11）。最终保留"固定 8 数组 + 运行时三元
+  选 W"。
+
+正确性：全量 conformance **104 executed / 7 refused / 0 failed**
+（`attention_basic` 6.0e-08、`attention_masked` 1.2e-07）；另建 7 个用例覆盖
+f32/f16、multi-chunk、causal mask、dropout、E>D，误差量级与重写前一致
+（f32 ≤6e-07，f16 ≤1.4e-02 且集中在 dropout 用例）。
+
+PV 侧成对读取未做：它需要每线程负责 2 个通道，partial 数翻倍、超出框架给定的
+`smem = 2*block*4 + E*4`；要扩 smem 就得在 `IluvatarBackend` 里覆盖
+`_op_attention` 自己算 grid/block/smem，属结构性改动，收益上限约 7%。
 
 ## 踩过的坑
 
@@ -247,3 +294,16 @@ CPU 开销，且 capture 本身有额外分支。池在基准结束时 38.9 MB /
     任何模块级/方法内的 `sum(...)` 都会拿到设备算子，`pool_stats` 因此报
     `int + DeviceArray`。改用显式循环计块数。`max` / `min` 未被覆盖。
     后续在此文件里写辅助逻辑时要留意同名覆盖。
+11. **天数 clang 在尝试自动向量化 divergent 地址的 f16 读取时会崩**：
+    `Cannot select: intrinsic %llvm.bi.ldp.vs.imm` +
+    `divergent base ptr of __ivcorex_ml_mem_load_* is detected, which must be
+    uniform`。触发条件是模板/数组布局一变，编译器就把相邻两次 f16 load 合并成
+    向量 intrinsic，而每 lane 的基址天然 divergent。规避方式是显式写成
+    "一次 32 位标量读 + 两次 bit_cast"（`af_ld2`），或保持数组形状固定、只把
+    展开宽度做模板参数（后者仍会崩，所以最终只用了前者）。改 attention 模板后
+    若出现这两条报错，先看是不是新增了"数组长度随模板参数变化"的写法。
+12. 框架 `device_attention.py` 的 `raw_mask = raw_mask[0]` 用**整数索引**取掉
+    前导维：numpy/cupy 会降维，天数的 `DeviceArray` 直接抛
+    `TypeError: CUDA 容器只支持切片（不降维）`。conformance 走的是 `(S,T)`
+    mask 所以没暴露；调用方若传 `(1,1,S,T)` 需先自己 reshape/squeeze。
+    已知缺陷，暂未改（属主框架，不在天数包内）。
