@@ -289,7 +289,9 @@ PV 侧成对读取未做：它需要每线程负责 2 个通道，partial 数翻
    sha256 清单，覆盖后校验失败，`installed_hardware()` 返回空，
    `get_backend("iluvatar")` 报"未注册的后端 iluvatar"（且报错点离真实原因很远）。
    任何改动都必须 `py -3.10 build.py` 重打包，再
-   `install_hardware(zip_path, replace=True)`。
+   `install_hardware("dist/iluvatar-0.1.0.zip", replace=True)`。**换机器、
+   升级框架或改天数包都适用**：不要 rsync / sftp 已安装树，也不要只替换其中
+   几个 `.py`，否则 manifest 校验失败的表现同上。
 10. `runtime.py` **模块级定义了设备函数 `sum`**（同名覆盖内置），所以文件里
     任何模块级/方法内的 `sum(...)` 都会拿到设备算子，`pool_stats` 因此报
     `int + DeviceArray`。改用显式循环计块数。`max` / `min` 未被覆盖。
@@ -302,8 +304,11 @@ PV 侧成对读取未做：它需要每线程负责 2 个通道，partial 数翻
     "一次 32 位标量读 + 两次 bit_cast"（`af_ld2`），或保持数组形状固定、只把
     展开宽度做模板参数（后者仍会崩，所以最终只用了前者）。改 attention 模板后
     若出现这两条报错，先看是不是新增了"数组长度随模板参数变化"的写法。
-12. 框架 `device_attention.py` 的 `raw_mask = raw_mask[0]` 用**整数索引**取掉
-    前导维：numpy/cupy 会降维，天数的 `DeviceArray` 直接抛
-    `TypeError: CUDA 容器只支持切片（不降维）`。conformance 走的是 `(S,T)`
-    mask 所以没暴露；调用方若传 `(1,1,S,T)` 需先自己 reshape/squeeze。
-    已知缺陷，暂未改（属主框架，不在天数包内）。
+12. ~~框架 `device_attention.py` 用整数索引取掉 mask 前导维~~ **已修复**
+    （主框架 5.292，代码 `c4444f5`）。原写法是 `raw_mask = raw_mask[0]`：
+    numpy/cupy 会降维，天数 `DeviceArray` 抛
+    `TypeError: CUDA 容器只支持切片（不降维）`。现在改为纯形状推导
+    `_mask_target_shape` + `reshape`，`(1,1,S,T)`、`(1,1,1,S,T)` 都能直接传，
+    调用方**不再需要**先 squeeze 成 `(S,T)`。
+    注意：天数包里装的是构建时打包的框架副本，旧包仍是缺陷版本；换机器或更新
+    后必须按坑 9 重打包 + `install_hardware(..., replace=True)` 重装。
