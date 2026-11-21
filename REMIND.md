@@ -306,12 +306,11 @@ GEMM 批次太小、启动与尾块占比上升；后者是 softmax 退回两遍
 
 **已否决、不要重试**：
 
-1. **自写 tensor-core flash**：`#include <mma.h>` 在 ivcore11 上只有 int8
-   （`I8M16N16K16/K32`）与 f32（`F32M16N16K8`，仅 `__ivcore20__`）的 fragment
-   特化；所有 f16 形状都报 `implicit instantiation of undefined template`
-   （`iluvatar_mma.h:146`）。强行绕开模板、按 4 种 16/32 形状硬写，编译能过
-   但结果全错（block=64 有数但错，block=32 出 nan）。**ivcore11 没有可用的
-   f16 tensor core API，这条路在硬件层就断了。**
+1. **自写 tensor-core flash**：~~ivcore11 没有可用的 f16 tensor core API~~
+   ——**这条结论已被推翻，见本节的「tensor core 侦察（第二轮）」**。第一轮
+   的失败原因是头文件选错：`#include <mma.h>` 命中的是
+   `IX/ixrt-ixsdk/mma.h`（15 行空壳），而 f16 特化在
+   `<crt/iluvatar_mma.h>` → `IX/crt-ixsdk/iluvatar_mma.h/.hpp` 里。
 2. **按 bh 切片做 L2 分片**：bh=32 的单片只要 0.250 ms，看起来 ×8 还能更快，
    但小批 GEMM 效率下降 + 4 次启动开销把收益全部吃掉，实测 2.0 ms。
 3. **用 `|q|*max|k|` 上界替代每行 max**：省掉 max 预扫，但 Cauchy-Schwarz 上界
@@ -322,6 +321,37 @@ GEMM 批次太小、启动与尾块占比上升；后者是 softmax 退回两遍
 mask(2,2,S,T) 1.094e-03、cross-head 8.646e-04、f32 plain 7.153e-07、
 f32 mask 5.960e-07、dropout 逐位 0.0009765625 = 1/1024 量化步长）；
 全量 conformance **104 executed / 7 refused / 0 failed，PASS**。
+
+#### tensor core 侦察（第二轮，2026-11-22）
+
+**f16 TCU 在 ivcore11 上确实存在**，第一轮「硬件层没有」的判断是错的。
+
+- 正确的公开入口是 `#include <crt/iluvatar_mma.h>`，它转发到
+  `IX/crt-ixsdk/iluvatar_mma.h`（声明）与 `.hpp`（1294 行实现）。
+  之前用 `<mma.h>` 命中 `IX/ixrt-ixsdk/mma.h`（15 行空壳），所以所有 f16
+  fragment 都报 undefined template。
+- 存在的 f16 特化（`ixix::wmma`，编译目标 ivcore11 实测通过，产出 2832 B
+  cubin）：
+  `fragment<matrix_a/b, 16,16,32, __half, row/col_major>`、
+  `fragment<accumulator,16,16,32,float>`，另有 32x32x16、16x32x32、32x16x32。
+  `mma_sync` 落到内建 `__ivcorex_matrix_mad_f32x4_f16x4`（16x16x32 形状一次
+  mma_sync 打两次该指令）。
+- **但 load/store 不是 CUDA wmma 语义**：`load_matrix_sync` **完全忽略 ldm**，
+  按 `CoordToOffset<16, mem_row_major|mem_col_major>` 寻址——这是 16x16 tile
+  的 XOR swizzle，例如 row_major 版：
+  `(i*256 + r/4*128) + ((r*32 + c*2 + (row&1) + i*64) & 127)`，
+  其中 `i=col/16, c=col%16, r=row/2`。也就是要求内存**已经按该 swizzle 排好**。
+- 实测（A/B 全 1，`<<<1,32>>>`）：C 一部分是 **16.1**（不是 32），其余数行是
+  未初始化垃圾（29827.9 / 22484.0）。说明 ① `store_matrix_sync` 同样写
+  swizzle 布局、② K=32 只累加了一半或 lane→(row,col) 映射与直觉不同。
+- 结论：要用 TCU 必须逆推这套私有布局（fragment 的 lane→元素映射、mad 的
+  输入语义都没有文档）。可行路径是黑盒探测：把 fragment 只置一个 1、
+  直接读 `c.x[]`（绕开 store 的 swizzle），确定映射后再自己写 `CoordToOffset`
+  重排 Q/K/V 的 tile。
+- 收益上限：flash 融合后流量从 637 MB 降到约 67 MB（只读 Q/K/V、写 O），
+  算力 8.6 GFLOP → 理论 ~0.2 ms，对比当前 1.394 ms 有 5–7 倍空间。
+  但前提是布局逆推成功，且自写分块的效率能接近 cuBLAS 的 97 TFLOPS。
+
 
 ### attention 融合内核重写（2026-11-21，历史，已被上一节替代）
 
