@@ -630,6 +630,14 @@ exp2、32 次 P 写 smem 与 2 次 load_matrix_sync，这些都在 TCU 空闲期
 10. **归约只做 2 步探底**：0.6391 ms（attn32 同期 0.7794）。相对 4 步只值
     0.037 ms，远小于按模型预期的 0.09 ms → 剩余时间已有相当部分不是 shuffle
     本身，继续减步数/加 tile 不划算。
+11. **命名 barrier / warp 组错相位**（本机最后一个结构性想法：让 block 内
+    两组 8 warp 各跑不同的 key tile 相位，使 TCU 与 ALU 在 SM 内并行）：
+    `asm volatile("bar.sync 1, 512;")` → `invalid instruction`；
+    `__barrier_sync` 在 `__clang_cuda_intrinsics.h` 里只有单参数 `id` 版本
+    （双参数不匹配），单参数版一用就让 clang++ 内部崩溃（llc 失败）。
+    → 无法在同 block 内做子集同步，这条路线关闭。
+    即使可用，smem 也卡在临界：两组各留 2 批 K/V(32 KB) + 各自 P(32 KB)
+    + ones(1 KB) = 65 KB > 单 block 65536 B 上限（还要保 2 block/SM）。
 
 ### 明天接着做
 
@@ -650,8 +658,13 @@ exp2、32 次 P 写 smem 与 2 次 load_matrix_sync，这些都在 TCU 空闲期
 
 13. **`err = 0` 可能是假象**：输出全 NaN/Inf 时 `fabs(nan - ref) > max` 恒
     false。bench 里要单独数 `if (got != got) ++nbad;`，用 `bad=` 报告。
-14. 探测脚本放在 `%TEMP%` 并直接用 `ssh -p 11155 ubuntu@39.156.149.45`
-    + 密码推送执行；**用完即删**，结论只留在本文件。
+14. 探测脚本放在 `%TEMP%`（paramiko，`ssh -p 11161 ubuntu@39.156.149.45`
+    / 密码 `orh0GGQ7`）推送执行；`ivc_run.py` 上传 `bench/tcu_flash_attn.cu`
+    并用 `/usr/local/corex-5.0.0/bin/clang++` 编译（**必须写绝对路径**，
+    PowerShell 会吞 `$COREX_PATH`；也不必先设 PATH）；运行参数 `T<nn>`
+    = `./tcu_flash_attn 0 1 <nn>`，其他原样传递（`256` = bench）。
+    **用完即删**，结论只留在本文件。注意 `py -3.10 x.py '<cmd>'` 里带管道
+    的命令会被 shell 吃掉，只用单条无管道命令。
 15. 清理进程曾把 `.git/index.lock` 移进回收站。不要用工具恢复；git 报锁错误
     时直接删掉该锁文件即可。
 16. **天数机器可能是"只装驱动"的裸镜像**：`/usr/local/corex-5.0.0` 仅 18 MB，
