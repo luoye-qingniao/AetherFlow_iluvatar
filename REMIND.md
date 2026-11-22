@@ -97,13 +97,23 @@ password: orh0GGQ7
   - 症状：硬件包装得上、`get_backend("iluvatar")` 报
     `OSError: 找不到天数 CUDA 运行时动态库（libcudart.so.10.2 / .10 / .so）`。
   - 驱动安装包留在 `/opt/corex-driver-linux64-5.0.0_x86_64.run`（18 MB）。
-- **缺的是 toolkit，需要单独装**（约 1.5 GB+，实测下载 2.5 MB/s）：
+- **缺的是 toolkit，必须单独装**（1.70 GB，实测下载 2.5 MB/s，约 12 分钟）：
   ```
   wget https://file-server-software-infra-sh.oss-cn-shanghai.aliyuncs.com/5.0.0/x86_64/sdk/corex-toolkit-linux64-5.0.0_x86_64_10.2.run
-  sudo sh corex-toolkit-linux64-5.0.0_x86_64_10.2.run    # 装完才有 clang++/cudart/cublas
   ```
-  安装完仍需上面的 `COREX_PATH` / `PATH` / `LD_LIBRARY_PATH` 三行。
-- 重建到"可跑包"的前置步骤（已在本机验证可行，2026-11-22）：
+  这个 run 是 Makeself 包，直接 `sh xxx.run` 会交互。**非交互安装的正确姿势**
+  （2026-11-22 已在本机跑通）：
+  ```
+  sudo sh corex-toolkit.run --noexec --nox11 --target /tmp/ci   # 只解包，5.5 GB
+  sudo /tmp/ci/corex-installer --silent --toolkit --skip-spacecheck \
+       --install-path /usr/local/corex-5.0.0
+  ```
+  `corex-installer` 的选项：`--silent` / `--driver` / `--toolbox` / `--toolkit` /
+  `--install-path` / `--skip-spacecheck`。不要选 `--driver`——驱动已装好，
+  重装驱动会重新编译 kmd 并可能重启服务。
+  装完得到 5.5 GB：clang 22.1.0、`libcudart.so.10.2.89`、`libcublas.so.10.2.3.254`、
+  `include/crt/iluvatar_mma.h`，`/usr/local/corex` 软链自动建好。
+- 重建到"可跑包"的前置步骤（2026-11-22 全部在本机验证）：
   1. `python3 -m venv /home/ubuntu/afenv`（镜像自带 pip 24.0，无需 apt）
   2. `afenv/bin/pip install -U numpy -i https://pypi.tuna.tsinghua.edu.cn/simple`
      → numpy 2.5.5
@@ -113,11 +123,13 @@ password: orh0GGQ7
   4. 上传 `dist/iluvatar-0.1.0.zip` →
      `install_hardware("/home/ubuntu/iluvatar-0.1.0.zip", replace=True)`
      （新机上验证过：`installed: iluvatar 0.1.0`、`registry: ['iluvatar']`）
-  5. 装 toolkit 后重跑 `get_backend("iluvatar")` 与 conformance
+  5. 装 toolkit → `get_backend("iluvatar")` 成功：MR-V100 / 32 GB / SM 16
+  6. 全量 conformance：**104 executed / 7 refused / 0 failed，68/68 ops，15.9s，
+     ok=True**——与旧机基线一致，环境等价
 - 机器 `ixsmi` 显示：`Iluvatar MR-V100`，32768 MiB，1500 MHz，driver 5.0.0，
   CUDA 10.2，`/dev/iluvatar0` 存在
-- 家目录无 `work` 之外的残留；下载/临时文件已清（`/home/ubuntu` 现只剩
-  `aetherflow`、`afenv`、`iluvatar-0.1.0.zip`）
+- 注意：`tar` 解出来的源码 + venv 只有几百 MB；真正的大件是
+  `/usr/local/corex-5.0.0`（5.5 GB）。换机重建的主要成本就是那 1.7 GB 下载。
 
 ## 进度
 
