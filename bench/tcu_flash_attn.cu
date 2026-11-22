@@ -13,19 +13,28 @@
 //     K/V 每头只从 gmem 搬一次。
 //   - 一个 tile = 32 个 key：8 次 mma 出 QK，10 次 mma 出 PV
 //     （8 个 E 分块 + 2 个 P@ones 求分母）。
-//   - max 必须每轮归约：降频会让 exp 溢出 half 上限（std≥2 的 f16 输入实测
-//     有 30%~50% 的元素变成 inf/nan）。
+//   - softmax 的 max 不必每轮归约（见下方"惰性基准"）。
 //   - 分母走 P@ones 的 mma，比 shuffle 归约 sum 快 13%。
-//   - 两个内核：attn32 每轮 32 key（精确基线 0.8309 ms）；
-//     attn64 每轮 64 key，两批 QK 合并成一次归约，归约密度减半。
+//   - 两个内核：attn32 每轮 32 key（精确基线 0.8284 ms）；
+//     attn64 每轮 64 key，两批 QK 并行取 ILP，归约用惰性基准（见下）。
+//
+// attn64 的算法核心是**惰性基准**：
+//   基准 ml 只在"某分数超出 ml+8（log2 空间）"时才用 4 步 shuffle 重算，
+//   检测就是一条 __any_sync（1 步，代替 8 段 × 4 步 shuffle）。
+//   基准滞后 ≤8 → exp2 上界 256，half 不会溢出；滞后导致的极小项下溢，
+//   归一化会自动抵消。sd=1/2/4/8/16 与 attn32 的 max abs err 完全一致。
+//   ml 存 smem（每 warp 32 float，共 2 KB）：8 个 float 常驻会顶破
+//   128 寄存器门槛（regs*1024*2 ≤ 262144），掉到 1 block/SM。
 //
 // 512x512x64、bh=256（实测）：
 //   attn32 0.8284 ms / 41475 GFLOPS（物化基线 1.394 ms）
-//   attn64 0.6737 ms / 51011 GFLOPS  <- 当前最优
+//   attn64 0.6725 ms / 51090 GFLOPS  <- 当前最优（regs=128 local=0）
 //   裸 mma 上限 83.4 TFLOPS；扣掉 2 条分母 mma 的 11% 浪费后约 74 TFLOPS。
 // 已排除：attn128（regs=154，每 SM 只剩 1 个 block，0.811 ms）、-O3、
-//   K 双批省同步、vbo 外提、2 步归约（只值 0.037 ms）。
-// 已采用：exp 走 log2 空间（分数直接乘 scale*log2e）、corr 无条件乘。
+//   K 双批省同步、vbo 外提、2 步归约（只值 0.037 ms）、
+//   只用一组 S fragment（失去两批 QK 的 ILP，0.681 ms）。
+// 已采用：exp 走 log2 空间（分数直接乘 scale*log2e）、corr 无条件乘、
+//   b/vb 共用同一组 matrix_b fragment。
 
 #include <crt/iluvatar_mma.h>
 #include <cuda_runtime.h>
@@ -221,7 +230,7 @@ __global__ void __launch_bounds__(NTH) attn32(
 // 每轮 64 个 key（两批 32）：两批 QK 合并成一次 4 步归约，归约密度减半。
 // K/V 各留两批，一次装载后只同步一次，批 A/B 之间不再有块级同步。
 // 数值与 attn32 同源（同一批 exact max），只是把两次归约并成一次。
-__global__ void __launch_bounds__(NTH) attn64(
+__global__ void __launch_bounds__(NTH, 2) attn64(
     const __half* __restrict__ Q, const __half* __restrict__ K,
     const __half* __restrict__ V, __half* __restrict__ O,
     int S, int T, float scale) {
@@ -245,10 +254,9 @@ __global__ void __launch_bounds__(NTH) attn64(
   __half* pw = psm + warp * 1024;
 
   fragment<matrix_a, 16, 16, 32, __half, row_major> a00, a01, a10, a11, pa0, pa1;
-  fragment<matrix_b, 16, 16, 32, __half, col_major> b0, b1, b2, b3;
-  fragment<matrix_b, 16, 16, 32, __half, col_major> vb0, vb1, vb2, vb3, vbo;
-  fragment<accumulator, 16, 16, 32, float> s00, s01, s10, s11;  // 批 A 的分数
-  fragment<accumulator, 16, 16, 32, float> t00, t01, t10, t11;  // 批 B 的分数
+  fragment<matrix_b, 16, 16, 32, __half, col_major> b0, b1, b2, b3, vbo;
+  fragment<accumulator, 16, 16, 32, float> s00, s01, s10, s11;  // 批 A 分数
+  fragment<accumulator, 16, 16, 32, float> t00, t01, t10, t11;  // 批 B 分数
   fragment<accumulator, 16, 16, 32, float> o0, o1, o2, o3, o4, o5, o6, o7, o8, o9;
 
   // Q 装载（同 attn32）：借 P 的 smem 分两批中转。
@@ -283,11 +291,10 @@ __global__ void __launch_bounds__(NTH) attn64(
 #pragma unroll
     for (int e = 0; e < 5; ++e) fill_fragment(*OF[g][e], 0.f);
 
-  float ml[2][4];   // 每行的 running max
-#pragma unroll
-  for (int g = 0; g < 2; ++g)
-#pragma unroll
-    for (int q = 0; q < 4; ++q) ml[g][q] = -1e30f;
+  // 每行基准放 smem（每 warp 32 行）：8 个 float 常驻会顶破 128 寄存器门槛，
+  // 那就只剩 1 个 block/SM。放 smem 只花 2 KB，每轮 16 次 LDS 完全藏得住。
+  __shared__ float mls[NWT * 32];
+  for (int idx = threadIdx.x; idx < NWT * 32; idx += NTH) mls[idx] = -1e30f;
 
   for (int idx = threadIdx.x; idx < 512; idx += NTH) {
     int t = idx >> 4, dd = idx & 15;
@@ -297,6 +304,7 @@ __global__ void __launch_bounds__(NTH) attn64(
   load_matrix_sync(vbo, ones_sm, 32);   // 分母矩阵不变，全程装一次
   // exp 走 log2 空间：分数直接乘 scale*log2e，省掉每次 exp 前的一次乘法。
   const float sc2 = scale * 1.4426950408889634f;
+  float* mlr = mls + warp * 32;         // mlr[g*16 + r0 + 4q]
 
   for (int kt = 0; kt < T; kt += 64) {
     const bool hasB = (kt + 32 < T);
@@ -322,7 +330,7 @@ __global__ void __launch_bounds__(NTH) attn64(
     mma_sync(s11, a10, b2, s11);
     mma_sync(s11, a11, b3, s11);
 
-    // 批 B 的 QK（T 不是 64 倍数时，最后半批用 -1e30 填充，exp 后为 0）
+    // 批 B 的 QK（T 不是 64 倍数时最后半批不存在，分数填 -1e30 使 exp 为 0）
     if (hasB) {
       fill_fragment(t00, 0.f);
       fill_fragment(t01, 0.f);
@@ -347,81 +355,101 @@ __global__ void __launch_bounds__(NTH) attn64(
       fill_fragment(t11, -1e30f);
     }
 
-    // 一次 4 步归约覆盖 64 个 key；批 B 的 exp 值先留在寄存器。
-    float eb[2][4][2];
+    // 惰性归约：基准 ml 只在"某分数超出基准 8 以上"时才重算。
+    // 检测是 warp 级 1 步 __any_sync（两批 64 个 key 一起判），正常输入几乎不触发，
+    // 于是省掉每轮 8 段 × 4 步 shuffle。基准最多落后 8（log2 空间），
+    // exp2 上界 256，half 安全；落后导致的那些小项下溢，对归一化影响可忽略。
+    bool risky = false;
 #pragma unroll
-    for (int g = 0; g < 2; ++g) {
+    for (int g = 0; g < 2; ++g)
+#pragma unroll
+      for (int q = 0; q < 4; ++q)
+        risky |= (fmaxf(fmaxf(SF[g][0]->x[q], SF[g][1]->x[q]),
+                        fmaxf(SB[g][0]->x[q], SB[g][1]->x[q])) *
+                      sc2 >
+                  mlr[g * 16 + r0 + 4 * q] + 8.f);
+    if (__any_sync(0xffffffffu, risky)) {
+#pragma unroll
+      for (int g = 0; g < 2; ++g)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          float x0 = SF[g][0]->x[q] * sc2, x1 = SF[g][1]->x[q] * sc2;
+          float x2 = SB[g][0]->x[q] * sc2, x3 = SB[g][1]->x[q] * sc2;
+          float mn = mlr[g * 16 + r0 + 4 * q], corr = 1.f;
+          float mx = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
+#pragma unroll
+          for (int off = 1; off < 16; off <<= 1)
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+          if (mx > mn) {
+            corr = exp2f(mn - mx);
+            mlr[g * 16 + r0 + 4 * q] = mx;
+          }
+#pragma unroll
+          for (int e = 0; e < 5; ++e) OF[g][e]->x[q] *= corr;
+        }
+    }
+    __syncwarp();   // 慢路径写过 smem 基准，快路径各 lane 要读到同一份
+    // 快路径：基准直接用 ml，不做任何跨 lane 归约；只写批 A 的 P（pw 只有一批的空间）。
+#pragma unroll
+    for (int g = 0; g < 2; ++g)
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
-        float x0 = SF[g][0]->x[q] * sc2, x1 = SF[g][1]->x[q] * sc2;
-        float x2 = SB[g][0]->x[q] * sc2, x3 = SB[g][1]->x[q] * sc2;
-        float mn = ml[g][q], corr = 1.f;
-        float mx = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
-#pragma unroll
-        for (int off = 1; off < 16; off <<= 1)
-          mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
-        if (mx > mn) {
-          corr = __exp2f(mn - mx);
-          mn = mx;
-          ml[g][q] = mx;
-        }
-        float e0 = __exp2f(x0 - mn), e1 = __exp2f(x1 - mn);
-        eb[g][q][0] = __exp2f(x2 - mn);
-        eb[g][q][1] = __exp2f(x3 - mn);
+        float mn = mlr[g * 16 + r0 + 4 * q];
         int row = r0 + 4 * q;
-        pw[g * 512 + off_row(row, c0)] = __float2half(e0);
-        pw[g * 512 + off_row(row, 16 + c0)] = __float2half(e1);
-#pragma unroll
-        for (int e = 0; e < 5; ++e) OF[g][e]->x[q] *= corr;
+        pw[g * 512 + off_row(row, c0)] =
+            __float2half(exp2f(SF[g][0]->x[q] * sc2 - mn));
+        pw[g * 512 + off_row(row, 16 + c0)] =
+            __float2half(exp2f(SF[g][1]->x[q] * sc2 - mn));
       }
-    }
 
-    // 批 A 的 PV
+    // 批 A 的 PV（b0..b3 与 QK 的 K 复用：QK 已算完，可以覆盖）
     __syncwarp();
     load_matrix_sync(pa0, pw, 32);
     load_matrix_sync(pa1, pw + 512, 32);
-    load_matrix_sync(vb0, vsm, 32);
-    load_matrix_sync(vb1, vsm + 512, 32);
-    load_matrix_sync(vb2, vsm + 1024, 32);
-    load_matrix_sync(vb3, vsm + 1536, 32);
-    mma_sync(o0, pa0, vb0, o0);
-    mma_sync(o1, pa0, vb1, o1);
-    mma_sync(o2, pa0, vb2, o2);
-    mma_sync(o3, pa0, vb3, o3);
-    mma_sync(o4, pa1, vb0, o4);
-    mma_sync(o5, pa1, vb1, o5);
-    mma_sync(o6, pa1, vb2, o6);
-    mma_sync(o7, pa1, vb3, o7);
+    load_matrix_sync(b0, vsm, 32);
+    load_matrix_sync(b1, vsm + 512, 32);
+    load_matrix_sync(b2, vsm + 1024, 32);
+    load_matrix_sync(b3, vsm + 1536, 32);
+    mma_sync(o0, pa0, b0, o0);
+    mma_sync(o1, pa0, b1, o1);
+    mma_sync(o2, pa0, b2, o2);
+    mma_sync(o3, pa0, b3, o3);
+    mma_sync(o4, pa1, b0, o4);
+    mma_sync(o5, pa1, b1, o5);
+    mma_sync(o6, pa1, b2, o6);
+    mma_sync(o7, pa1, b3, o7);
     mma_sync(o8, pa0, vbo, o8);
     mma_sync(o9, pa1, vbo, o9);
 
     if (hasB) {
-      // pa0/pa1 已在寄存器里，pw 可以复用；V 换到第二批。
+      // 批 B 的 P 在这里现算（不占暂存寄存器），pw 已空出。
       __syncwarp();
 #pragma unroll
-      for (int g = 0; g < 2; ++g) {
+      for (int g = 0; g < 2; ++g)
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
+          float mn = mlr[g * 16 + r0 + 4 * q];
           int row = r0 + 4 * q;
-          pw[g * 512 + off_row(row, c0)] = __float2half(eb[g][q][0]);
-          pw[g * 512 + off_row(row, 16 + c0)] = __float2half(eb[g][q][1]);
+          pw[g * 512 + off_row(row, c0)] =
+              __float2half(exp2f(SB[g][0]->x[q] * sc2 - mn));
+          pw[g * 512 + off_row(row, 16 + c0)] =
+              __float2half(exp2f(SB[g][1]->x[q] * sc2 - mn));
         }
-      }
       __syncwarp();
       load_matrix_sync(pa0, pw, 32);
       load_matrix_sync(pa1, pw + 512, 32);
-      load_matrix_sync(vb0, vsm + 2048, 32);
-      load_matrix_sync(vb1, vsm + 2048 + 512, 32);
-      load_matrix_sync(vb2, vsm + 2048 + 1024, 32);
-      load_matrix_sync(vb3, vsm + 2048 + 1536, 32);
-      mma_sync(o0, pa0, vb0, o0);
-      mma_sync(o1, pa0, vb1, o1);
-      mma_sync(o2, pa0, vb2, o2);
-      mma_sync(o3, pa0, vb3, o3);
-      mma_sync(o4, pa1, vb0, o4);
-      mma_sync(o5, pa1, vb1, o5);
-      mma_sync(o6, pa1, vb2, o6);
-      mma_sync(o7, pa1, vb3, o7);
+      load_matrix_sync(b0, vsm + 2048, 32);
+      load_matrix_sync(b1, vsm + 2048 + 512, 32);
+      load_matrix_sync(b2, vsm + 2048 + 1024, 32);
+      load_matrix_sync(b3, vsm + 2048 + 1536, 32);
+      mma_sync(o0, pa0, b0, o0);
+      mma_sync(o1, pa0, b1, o1);
+      mma_sync(o2, pa0, b2, o2);
+      mma_sync(o3, pa0, b3, o3);
+      mma_sync(o4, pa1, b0, o4);
+      mma_sync(o5, pa1, b1, o5);
+      mma_sync(o6, pa1, b2, o6);
+      mma_sync(o7, pa1, b3, o7);
       mma_sync(o8, pa0, vbo, o8);
       mma_sync(o9, pa1, vbo, o9);
     }

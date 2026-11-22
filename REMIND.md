@@ -158,9 +158,10 @@ password: orh0GGQ7
       24653 GFLOPS**（18.1 ms 的 13×，已达 522 GB/s 硬下限的 87.5%），
       对拍 7 项 + 全量 conformance 仍 PASS（见"GEMM 物化 attention"一节）
 - [x] TCU flash attention（自写内核，`bench/tcu_flash_attn.cu`）：NW=16 + 每轮
-      64 key 合并归约的 attn64 达 **0.6737 ms / 51011 GFLOPS**，为物化基线的
-      2.07×（attn32 基线 0.8284 ms）；未接入包内，待验证 Δ 平移 +
-      mask/dropout 后再接（见"TCU flash attention"一节）
+      64 key + **惰性基准**（`__any_sync` 门控，每 64 key 才可能归约一次）的
+      attn64 达 **0.6725 ms / 51090 GFLOPS**（regs=128 local=0），为物化基线的
+      2.07×（attn32 基线 0.8289 ms）；未接入包内，待补 mask/dropout 后再接
+      （见"TCU flash attention"一节）
 
 ## 训练层接入（框架侧唯一改动）
 
@@ -571,40 +572,56 @@ K/V 每头只搬一次到 smem。每轮一个 tile 的 key 做 8 次 mma 出 QK
 - `attn32`：tile=32 key，每 warp 只占 2 个分数累加器 × 2 行组，smem 41984 B
   （K/V 各 2048 + P 16×1024 + ones）。数值基线 0.8284 ms。
 - `attn64`：tile=64 key（两批 32），K/V 各留两批（smem 50176 B，仍满足
-  2 block/SM），一次装载一次 `__syncthreads()`；两批 QK 全做完后**一次**
-  4 步 shuffle 覆盖 64 个 key，批 B 的 exp 值先存 `eb[2][4][2]` 寄存器，
-  批 A 的 PV 做完再写回 `pw` 复用。归约密度减半 → 0.6737 ms。
+  2 block/SM），一次装载一次 `__syncthreads()`。两批 QK（8+8 条 mma）全部
+  做完后**不做归约**，只用一条 `__any_sync` 检测"是否有分数超出基准+8"；
+  批 A 的 P 立即写 `pw` 并做 PV（复用 b 片段装 V），批 B 的 P 在批 A 的 PV
+  之后现算、再复写 `pw` 做第二批 PV（省 8 个常驻寄存器）。0.6725 ms。
 - 占用门槛：1024 线程/block 时 `regs*1024*2 ≤ 262144` 即 `regs ≤ 128`
-  才能 2 block/SM；attn64 实测 regs=122，余量很小（再加一批分数就掉档，
-  见否决项 6）。
-- exp 走 **log2 空间**：分数直接乘 `scale*log2e`，softmax 用 `__exp2f`，
-  省掉每次 exp 前的乘法；`corr` 无条件乘（不判 `!= 1.f`）。
+  才能 2 block/SM；attn64 实测 **regs=128 local=0**，恰好卡在门槛上。
+  为压到 128：① running max `ml` 存 smem（每 warp 32 个 float，共 2 KB，
+  8 个常驻 float 会让 regs 涨到 131 → 掉到 1 block/SM）；② `b0..b3` 与
+  批 A/B 的 V 片段**共用同一组 matrix_b**（不再单开 `vb0..vb3`）。
+- exp 走 **log2 空间**：分数直接乘 `scale*log2e`，softmax 用 `exp2f`
+  （本机没有 `__exp2f`，只有 `exp2f`）；`corr` 无条件乘。
 
-每轮归约的写法（attn64，log2 空间，4 步覆盖 64 个 key）：
+每 64 key 的惰性基准写法（attn64，log2 空间）：
 
 ```cpp
-float mn = ml[g][q], corr = 1.f;
-float mx = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
-for (int off = 1; off < 16; off <<= 1)
-    mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
-if (mx > mn) { corr = __exp2f(mn - mx); mn = mx; ml[g][q] = mx; }
-// e0..e3 = __exp2f(x_i - mn)（x_i 已乘 scale*log2e）
+// 两批 QK 都已算完：SF = 批 A 分数，SB = 批 B 分数，mlr 在 smem
+bool risky = false;
+for (q...) risky |= (fmaxf(fmaxf(SF[g][0]->x[q], SF[g][1]->x[q]),
+                           fmaxf(SB[g][0]->x[q], SB[g][1]->x[q])) * sc2 >
+                     mlr[g*16 + r0 + 4*q] + 8.f);
+if (__any_sync(0xffffffffu, risky)) {          // 1 步代替 8 段 × 4 步
+    // 慢路径：8 段各 4 步 shuffle 求 mx，corr = exp2f(mn - mx)，OF *= corr
+    mlr[g*16 + r0 + 4*q] = mx;                 // 16 lane 同址同值
+}
+__syncwarp();   // 慢路径改过 smem，快路径各 lane 要读到同一份
+// 快路径：P = exp2f(SF[g][k]->x[q]*sc2 - mn)，mn 从 mlr 读
 ```
+
+为什么安全：基准最多滞后真实 max 8（log2 空间）→ P 上界 2^8 = 256，
+half（上限 65504）不会溢出；滞后导致的极小项下溢后反正会被 softmax 的
+归一化抹掉。`sd=1/2/4/8/16` 的 max abs err 与 attn32 **逐值一致**，
+`T=32/64/96/128/256` 全部 `bad=0`。
 
 ### 实测（512×512×64，bh=256，reps=20）
 
 | 变体 | ms | GFLOPS |
 | --- | --- | --- |
 | GEMM 物化基线（当前包内实现） | 1.394 | 24653 |
-| TCU flash attn32（每轮 32 key，精确归约） | 0.8284 | 41475 |
-| **TCU flash attn64（每轮 64 key，两批归约合并）** | **0.6737** | **51011** |
+| TCU flash attn32（每轮 32 key，精确归约） | 0.8289 | 41452 |
+| **TCU flash attn64（惰性基准，两批 QK 并行）** | **0.6725** | **51090** |
 | attn64 两批不归约（数值错，仅作上限） | 0.4804 | 71520 |
 | 裸 mma 上限 | — | 83370 |
 
-结论：attn64 **0.6737 ms = 物化基线的 2.07×**。理论上限：裸 mma 83.4 TFLOPS
+结论：attn64 **0.6725 ms = 物化基线的 2.07×**。理论上限：裸 mma 83.4 TFLOPS
 里分母 mma 固定浪费 2/18 条（11%），扣完约 74 TFLOPS；attn64 的 51 TFLOPS
-= 该上限的 69%，缺口是每 64 key 一次的 4 步 shuffle（8 段 × 4 步）、32 次
-exp2、32 次 P 写 smem 与 2 次 load_matrix_sync，这些都在 TCU 空闲期串行执行。
+= 该上限的 69%，缺口是 32 次 exp2、32 次 P 写 smem、2 次
+`load_matrix_sync` 与 2 次 `__syncwarp`，这些都在 TCU 空闲期串行执行。
+惰性基准把归约从"每 64 key 8 段 × 4 步"降到"常态 1 条 `__any_sync`"，
+但省下的 shuffle 时间与新增的 smem 基准读写基本抵消（0.6737 → 0.6725），
+真正收益是把 regs 从 122 拉到 128 门槛上而无 spill、结构更干净。
 注意：**同一编译单元内才有可比性**（多实例编译会整体变慢 10~20%）。
 
 ### 已否决的方向（不要再试）
@@ -616,9 +633,12 @@ exp2、32 次 P 写 smem 与 2 次 load_matrix_sync，这些都在 TCU 空闲期
 2. **双缓冲 K/V**：regs 119→131 超 128，占用掉到 3 blocks/SM，1.0733 ms 更慢。
 3. **gmem 直读 A fragment**：布局不符（见上），err 3.29。
 4. **K/V 预变换后 gmem 直读**：1.4955 ms，慢于 smem 重排。
-5. **`__any_sync` / `__ballot_sync` 门控归约**：`<<<1,64>>>` 探针里
-   `__any_sync` 正确、但 `__ballot_sync` 恒返回 0；放进大 block 后数值错
-   （err 1.68593）且更慢（0.9726 vs 0.9035 ms）。天数这套 vote intrinsic 不可用。
+5. **`__ballot_sync` 不可用；`__any_sync` 可用（早期结论有误，已修正）**。
+   `<<<1,64>>>` 探针里 `__any_sync` 正确、`__ballot_sync` 恒返回 0。
+   早期"放进大 block 后数值错（err 1.68593）且更慢"是把 ballot 结果当成
+   any 用的是误判。现在惰性基准用的 `__any_sync(0xffffffffu, pred)`
+   （底层 `__ixvm_vote_any_sync`，mask 是 32 位）在 1024 线程 block 里
+   sd=1/2/4/8/16 全部 `bad=0`，已在用。**`__ballot_sync` 仍不可用。**
 6. **attn128（每轮 128 key，4 批合并归约）**：regs 122→154，`154*1024*2 >
    262144` → 每 SM 只剩 1 个 block，实测 0.8112 ms，比 attn64 慢 20%。
    要保 2 block/SM 必须 regs ≤ 128，而 16 个分数累加器已占 64 个。
@@ -638,6 +658,15 @@ exp2、32 次 P 写 smem 与 2 次 load_matrix_sync，这些都在 TCU 空闲期
     → 无法在同 block 内做子集同步，这条路线关闭。
     即使可用，smem 也卡在临界：两组各留 2 批 K/V(32 KB) + 各自 P(32 KB)
     + ones(1 KB) = 65 KB > 单 block 65536 B 上限（还要保 2 block/SM）。
+12. **单组 S fragment（批 B 的 QK 排到批 A 的 PV 之后）**：regs=118、
+    local=0（寄存器更宽松），但实测 0.6811 ms，反而比两组 S 慢 1.3%。
+    原因：两批 QK 不再能背靠背发射，TCU 在等批 A 的 exp/PV 时空转，
+    丢掉 ILP。已回退为两组 S。
+13. **P 直接填 A fragment、省掉 smem 往返**（读 `iluvatar_mma.hpp` 后静态
+    否决，未实测）：A fragment 槽位要的是 `row = 2*r0 / 2*r0+1 / +8 / +9`
+    的同列相邻两行，而 accumulator 的行是 `r0 + 4q`，两者映射不一致；
+    P 直填需要大量跨 lane shuffle 重排，比现在的"写 pw + 2 次
+    `load_matrix_sync`"更贵。
 
 ### 明天接着做
 
@@ -656,18 +685,18 @@ exp2、32 次 P 写 smem 与 2 次 load_matrix_sync，这些都在 TCU 空闲期
 
 ### 本轮随手记的坑
 
-13. **`err = 0` 可能是假象**：输出全 NaN/Inf 时 `fabs(nan - ref) > max` 恒
+14. **`err = 0` 可能是假象**：输出全 NaN/Inf 时 `fabs(nan - ref) > max` 恒
     false。bench 里要单独数 `if (got != got) ++nbad;`，用 `bad=` 报告。
-14. 探测脚本放在 `%TEMP%`（paramiko，`ssh -p 11161 ubuntu@39.156.149.45`
+15. 探测脚本放在 `%TEMP%`（paramiko，`ssh -p 11161 ubuntu@39.156.149.45`
     / 密码 `orh0GGQ7`）推送执行；`ivc_run.py` 上传 `bench/tcu_flash_attn.cu`
     并用 `/usr/local/corex-5.0.0/bin/clang++` 编译（**必须写绝对路径**，
     PowerShell 会吞 `$COREX_PATH`；也不必先设 PATH）；运行参数 `T<nn>`
     = `./tcu_flash_attn 0 1 <nn>`，其他原样传递（`256` = bench）。
     **用完即删**，结论只留在本文件。注意 `py -3.10 x.py '<cmd>'` 里带管道
     的命令会被 shell 吃掉，只用单条无管道命令。
-15. 清理进程曾把 `.git/index.lock` 移进回收站。不要用工具恢复；git 报锁错误
+16. 清理进程曾把 `.git/index.lock` 移进回收站。不要用工具恢复；git 报锁错误
     时直接删掉该锁文件即可。
-16. **天数机器可能是"只装驱动"的裸镜像**：`/usr/local/corex-5.0.0` 仅 18 MB，
+17. **天数机器可能是"只装驱动"的裸镜像**：`/usr/local/corex-5.0.0` 仅 18 MB，
     没有 cudart / cublas / clang++ / include。此时硬件包装得上但
     `get_backend` 报找不到 `libcudart.so.10.2`。按「远端验证机 → 新机」
     的链接装 toolkit 再试，不要怀疑硬件包或 manifest。
