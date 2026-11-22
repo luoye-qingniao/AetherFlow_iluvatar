@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 
 using namespace ixix::wmma;
 
@@ -59,6 +60,33 @@ __host__ __device__ __forceinline__ int off_col(int row, int col) {
 #define NWT 16                 // warp 数；每 warp 32 行 -> 每 block 512 行
 #define NTH (NWT * 64)
 
+#define AF_LOG2E 1.4426950408889634f
+
+// dropout 的 0/1 判定，与包内 af_drop_w / attention_rand 逐位一致：
+// idx = (bh*S + s) * T + t，u 取 hash 的 24 位高段。
+__device__ __forceinline__ unsigned long long af_rand(unsigned long long seed,
+                                                      long long idx) {
+  unsigned long long z = seed + (unsigned long long)idx * 0x9E3779B97F4A7C15ULL;
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return z ^ (z >> 31);
+}
+__device__ __forceinline__ float af_drop_w(float p, float p_drop, float drop_scale,
+                                           unsigned long long seed, long long idx) {
+  const unsigned long long z = af_rand(seed, idx);
+  const float u = (float)((z >> 40) & 0xFFFFFFULL) * (1.0f / 16777216.0f);
+  return (u >= p_drop) ? p * drop_scale : 0.f;
+}
+
+// 加性 mask 的行指针：展平 [bh*S + s, T]；mask_shared 时按 s 取模到 S 行。
+// 内核里不用这个（每轮调一次太贵，改成循环外算基址），保留给 bench 参考端。
+__host__ __device__ __forceinline__ const __half* mask_row(const __half* M,
+                                                           int mask_shared, int bh,
+                                                           int S, int gl, int T) {
+  const long long r = mask_shared ? (long long)(gl % S) : ((long long)bh * S + gl);
+  return M + r * T;
+}
+
 // 32 个 key 的 K/V 重排进 swizzle 布局的 smem。每次 2048 个 half（64x32）。
 __device__ __forceinline__ void load_kv(__half* ks, __half* vs, const __half* Kb0,
                                         const __half* Vb0, int kt) {
@@ -70,11 +98,13 @@ __device__ __forceinline__ void load_kv(__half* ks, __half* vs, const __half* Kb
   }
 }
 
-// 每轮 32 个 key，每行每轮一次 4 步 shuffle 的精确 max（基线 0.83 ms）
+// 每轮 32 个 key，每行每轮一次 4 步 shuffle 的精确 max（基线 0.83 ms）。
+// mask/dropout 只在 attn64 上实现，这里保留参数位以便共用 bench 调用约定。
 __global__ void __launch_bounds__(NTH) attn32(
     const __half* __restrict__ Q, const __half* __restrict__ K,
     const __half* __restrict__ V, __half* __restrict__ O,
-    int S, int T, float scale) {
+    int S, int T, float scale, const __half*, float, float, unsigned long long, int,
+    int) {
   extern __shared__ __half sm[];
   __half* ksm = sm;                    // 2 x 32x16 (K 的两个 16 列组)
   __half* vsm = ksm + 2048;            // 4 x 16x16
@@ -227,18 +257,28 @@ __global__ void __launch_bounds__(NTH) attn32(
   }
 }
 
-// 每轮 64 个 key（两批 32）：两批 QK 合并成一次 4 步归约，归约密度减半。
+// 每轮 64 个 key（两批 32）：两批 QK 背靠背发射，惰性基准只在超界时归约。
 // K/V 各留两批，一次装载后只同步一次，批 A/B 之间不再有块级同步。
-// 数值与 attn32 同源（同一批 exact max），只是把两次归约并成一次。
+// mask 是加性（与原融合内核一致，行优先 [rows,T]，可 S 行共享）；
+// dropout 用 af_drop_w（同一 seed 逐位一致），分母仍累加 dropout 之前的 p。
+// HAS_MASK / HAS_DROP 做成模板参数：运行时 bool 会让编译器为两条路径同时
+// 保活寄存器，plain 实例从 local=0 掉到 ~500 B/线程，性能崩到 13 ms。
+// mask/dropout 需要额外的行指针与 64 位 hash 状态，128 寄存器装不下会
+// spill 到 local（340 B/线程时慢 4.7 倍），因此这两类实例改按 1 block/SM
+// 编译（上限 255 寄存器）；plain 实例仍是 2 block/SM。
+template <bool HAS_MASK, bool HAS_DROP>
 __global__ void __launch_bounds__(NTH, 2) attn64(
     const __half* __restrict__ Q, const __half* __restrict__ K,
     const __half* __restrict__ V, __half* __restrict__ O,
-    int S, int T, float scale) {
+    int S, int T, float scale, const __half* __restrict__ M, float p_drop,
+    float drop_scale, unsigned long long seed, int /*has_mask*/, int mask_shared) {
   extern __shared__ __half sm[];
   __half* ksm = sm;                    // 两批 K，各 2048（一次装载，免中间同步）
   __half* vsm = ksm + 4096;            // 两批 V，各 4 x 16x16
   __half* psm = vsm + 4096;            // 每 warp 一个 16x32 的 P（两批复用）
   __half* ones_sm = psm + NWT * 1024;  // 16x16 全 1，用于 P@ones
+  __shared__ float mls[NWT * 32];      // 惰性基准（每 warp 32 行）
+  __shared__ float ssums[NWT * 32];    // dropout 模式下的分母（每 warp 32 行）
 
   const int warp = threadIdx.x >> 6;
   const int lane = threadIdx.x & 63;
@@ -293,8 +333,10 @@ __global__ void __launch_bounds__(NTH, 2) attn64(
 
   // 每行基准放 smem（每 warp 32 行）：8 个 float 常驻会顶破 128 寄存器门槛，
   // 那就只剩 1 个 block/SM。放 smem 只花 2 KB，每轮 16 次 LDS 完全藏得住。
-  __shared__ float mls[NWT * 32];
-  for (int idx = threadIdx.x; idx < NWT * 32; idx += NTH) mls[idx] = -1e30f;
+  for (int idx = threadIdx.x; idx < NWT * 32; idx += NTH) {
+    mls[idx] = -1e30f;
+    ssums[idx] = 0.f;
+  }
 
   for (int idx = threadIdx.x; idx < 512; idx += NTH) {
     int t = idx >> 4, dd = idx & 15;
@@ -303,8 +345,20 @@ __global__ void __launch_bounds__(NTH, 2) attn64(
   __syncthreads();
   load_matrix_sync(vbo, ones_sm, 32);   // 分母矩阵不变，全程装一次
   // exp 走 log2 空间：分数直接乘 scale*log2e，省掉每次 exp 前的一次乘法。
-  const float sc2 = scale * 1.4426950408889634f;
+  const float sc2 = scale * AF_LOG2E;
   float* mlr = mls + warp * 32;         // mlr[g*16 + r0 + 4q]
+  float* ssr = ssums + warp * 32;       // dropout 分母
+
+  // mask/dropout 的行基址只随 (g,q) 偏移，row_base+r0 是每线程常量，循环外
+  // 算一次；否则每轮每个 (g,q) 都要做一次 (gl % S) 整数除法（mask 路径的
+  // 主要开销，去掉后 m 模式从 2.1 ms 降到 1.3 ms 量级）。
+  const __half* mbase = nullptr;
+  long long dbase = 0;
+  if (HAS_MASK) {
+    const int mr0 = (mask_shared ? (row_base % S) : (bh * S + row_base)) + r0;
+    mbase = M + (long long)mr0 * T;
+  }
+  if (HAS_DROP) dbase = (long long)(bh * S + row_base + r0) * T;
 
   for (int kt = 0; kt < T; kt += 64) {
     const bool hasB = (kt + 32 < T);
@@ -359,15 +413,26 @@ __global__ void __launch_bounds__(NTH, 2) attn64(
     // 检测是 warp 级 1 步 __any_sync（两批 64 个 key 一起判），正常输入几乎不触发，
     // 于是省掉每轮 8 段 × 4 步 shuffle。基准最多落后 8（log2 空间），
     // exp2 上界 256，half 安全；落后导致的那些小项下溢，对归一化影响可忽略。
+    // 加性 mask 在 exp 之内，log2 空间里同样乘 log2e。
     bool risky = false;
 #pragma unroll
     for (int g = 0; g < 2; ++g)
 #pragma unroll
-      for (int q = 0; q < 4; ++q)
-        risky |= (fmaxf(fmaxf(SF[g][0]->x[q], SF[g][1]->x[q]),
-                        fmaxf(SB[g][0]->x[q], SB[g][1]->x[q])) *
-                      sc2 >
+      for (int q = 0; q < 4; ++q) {
+        float x0 = SF[g][0]->x[q] * sc2, x1 = SF[g][1]->x[q] * sc2;
+        float x2 = SB[g][0]->x[q] * sc2, x3 = SB[g][1]->x[q] * sc2;
+        if (HAS_MASK) {
+          const __half* mr = mbase + ((g * 16 + 4 * q) * T + kt);
+          x0 += __half2float(mr[c0]) * AF_LOG2E;
+          x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
+          if (hasB) {
+            x2 += __half2float(mr[32 + c0]) * AF_LOG2E;
+            x3 += __half2float(mr[48 + c0]) * AF_LOG2E;
+          }
+        }
+        risky |= (fmaxf(fmaxf(x0, x1), fmaxf(x2, x3)) >
                   mlr[g * 16 + r0 + 4 * q] + 8.f);
+      }
     if (__any_sync(0xffffffffu, risky)) {
 #pragma unroll
       for (int g = 0; g < 2; ++g)
@@ -375,6 +440,15 @@ __global__ void __launch_bounds__(NTH, 2) attn64(
         for (int q = 0; q < 4; ++q) {
           float x0 = SF[g][0]->x[q] * sc2, x1 = SF[g][1]->x[q] * sc2;
           float x2 = SB[g][0]->x[q] * sc2, x3 = SB[g][1]->x[q] * sc2;
+          if (HAS_MASK) {
+            const __half* mr = mbase + ((g * 16 + 4 * q) * T + kt);
+            x0 += __half2float(mr[c0]) * AF_LOG2E;
+            x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
+            if (hasB) {
+              x2 += __half2float(mr[32 + c0]) * AF_LOG2E;
+              x3 += __half2float(mr[48 + c0]) * AF_LOG2E;
+            }
+          }
           float mn = mlr[g * 16 + r0 + 4 * q], corr = 1.f;
           float mx = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
 #pragma unroll
@@ -383,6 +457,9 @@ __global__ void __launch_bounds__(NTH, 2) attn64(
           if (mx > mn) {
             corr = exp2f(mn - mx);
             mlr[g * 16 + r0 + 4 * q] = mx;
+            // dropout 的分母是 float 逐轮累加，分子 OF 在这里乘了 corr；
+            // 分母必须同步乘，否则基准上调后旧轮次的贡献尺度不一致。
+            if (HAS_DROP && c0 == 0) ssr[g * 16 + r0 + 4 * q] *= corr;
           }
 #pragma unroll
           for (int e = 0; e < 5; ++e) OF[g][e]->x[q] *= corr;
@@ -395,11 +472,26 @@ __global__ void __launch_bounds__(NTH, 2) attn64(
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
         float mn = mlr[g * 16 + r0 + 4 * q];
+        float x0 = SF[g][0]->x[q] * sc2, x1 = SF[g][1]->x[q] * sc2;
+        if (HAS_MASK) {
+          const __half* mr = mbase + ((g * 16 + 4 * q) * T + kt);
+          x0 += __half2float(mr[c0]) * AF_LOG2E;
+          x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
+        }
+        float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
+        if (HAS_DROP) {
+          const long long base = dbase + (g * 16 + 4 * q) * T + kt;
+          float sv = p0 + p1;
+          p0 = af_drop_w(p0, p_drop, drop_scale, seed, base + c0);
+          p1 = af_drop_w(p1, p_drop, drop_scale, seed, base + 16 + c0);
+#pragma unroll
+          for (int off = 1; off < 16; off <<= 1)
+            sv += __shfl_xor_sync(0xffffffffu, sv, off);
+          if (c0 == 0) ssr[g * 16 + r0 + 4 * q] += sv;
+        }
         int row = r0 + 4 * q;
-        pw[g * 512 + off_row(row, c0)] =
-            __float2half(exp2f(SF[g][0]->x[q] * sc2 - mn));
-        pw[g * 512 + off_row(row, 16 + c0)] =
-            __float2half(exp2f(SF[g][1]->x[q] * sc2 - mn));
+        pw[g * 512 + off_row(row, c0)] = __float2half(p0);
+        pw[g * 512 + off_row(row, 16 + c0)] = __float2half(p1);
       }
 
     // 批 A 的 PV（b0..b3 与 QK 的 K 复用：QK 已算完，可以覆盖）
@@ -418,8 +510,10 @@ __global__ void __launch_bounds__(NTH, 2) attn64(
     mma_sync(o5, pa1, b1, o5);
     mma_sync(o6, pa1, b2, o6);
     mma_sync(o7, pa1, b3, o7);
-    mma_sync(o8, pa0, vbo, o8);
-    mma_sync(o9, pa1, vbo, o9);
+    if (!HAS_DROP) {   // dropout 时分母走 shuffle 求和，省掉这 2 条 mma
+      mma_sync(o8, pa0, vbo, o8);
+      mma_sync(o9, pa1, vbo, o9);
+    }
 
     if (hasB) {
       // 批 B 的 P 在这里现算（不占暂存寄存器），pw 已空出。
@@ -429,11 +523,26 @@ __global__ void __launch_bounds__(NTH, 2) attn64(
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
           float mn = mlr[g * 16 + r0 + 4 * q];
+          float x0 = SB[g][0]->x[q] * sc2, x1 = SB[g][1]->x[q] * sc2;
+          if (HAS_MASK) {
+            const __half* mr = mbase + ((g * 16 + 4 * q) * T + kt);
+            x0 += __half2float(mr[32 + c0]) * AF_LOG2E;
+            x1 += __half2float(mr[48 + c0]) * AF_LOG2E;
+          }
+          float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
+          if (HAS_DROP) {
+            const long long base = dbase + (g * 16 + 4 * q) * T + kt + 32;
+            float sv = p0 + p1;
+            p0 = af_drop_w(p0, p_drop, drop_scale, seed, base + c0);
+            p1 = af_drop_w(p1, p_drop, drop_scale, seed, base + 16 + c0);
+#pragma unroll
+            for (int off = 1; off < 16; off <<= 1)
+              sv += __shfl_xor_sync(0xffffffffu, sv, off);
+            if (c0 == 0) ssr[g * 16 + r0 + 4 * q] += sv;
+          }
           int row = r0 + 4 * q;
-          pw[g * 512 + off_row(row, c0)] =
-              __float2half(exp2f(SB[g][0]->x[q] * sc2 - mn));
-          pw[g * 512 + off_row(row, 16 + c0)] =
-              __float2half(exp2f(SB[g][1]->x[q] * sc2 - mn));
+          pw[g * 512 + off_row(row, c0)] = __float2half(p0);
+          pw[g * 512 + off_row(row, 16 + c0)] = __float2half(p1);
         }
       __syncwarp();
       load_matrix_sync(pa0, pw, 32);
@@ -450,18 +559,20 @@ __global__ void __launch_bounds__(NTH, 2) attn64(
       mma_sync(o5, pa1, b1, o5);
       mma_sync(o6, pa1, b2, o6);
       mma_sync(o7, pa1, b3, o7);
-      mma_sync(o8, pa0, vbo, o8);
-      mma_sync(o9, pa1, vbo, o9);
+      if (!HAS_DROP) {
+        mma_sync(o8, pa0, vbo, o8);
+        mma_sync(o9, pa1, vbo, o9);
+      }
     }
     __syncthreads();
   }
 
-  // 归一化放在输出上：(p/l)@V == (p@V)/l，与 attn32 一致。
+  // 归一化放在输出上：(p/l)@V == (p@V)/l。dropout 时 l 是 dropout 前的和。
 #pragma unroll
   for (int g = 0; g < 2; ++g) {
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
-      float den = OF[g][4]->x[q];
+      float den = HAS_DROP ? ssr[g * 16 + r0 + 4 * q] : OF[g][4]->x[q];
       float inv = den != 0.f ? 1.f / den : 0.f;
       int row = row_base + g * 16 + r0 + 4 * q;
 #pragma unroll
@@ -488,10 +599,24 @@ static __half* mk_gauss(size_t n, int seed, float sd) {
   return h;
 }
 
+static float af_drop_w_host(float p, float p_drop, float drop_scale,
+                            unsigned long long seed, long long idx) {
+  unsigned long long z = seed + (unsigned long long)idx * 0x9E3779B97F4A7C15ULL;
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  z ^= z >> 31;
+  const float u = (float)((z >> 40) & 0xFFFFFFULL) * (1.0f / 16777216.0f);
+  return (u >= p_drop) ? p * drop_scale : 0.f;
+}
+
 static void ref_rows(const __half* Q, const __half* K, const __half* V, int S, int T,
-                     int head, int r0, int r1, double scale, double* out) {
+                     int head, int r0, int r1, double scale, double* out,
+                     const __half* M = nullptr, int mask_shared = 0, float p_drop = 0.f,
+                     unsigned long long seed = 0) {
+  const float drop_scale = p_drop > 0.f ? 1.f / (1.f - p_drop) : 1.f;
   double* sc = (double*)malloc(sizeof(double) * T);
   for (int r = r0; r < r1; ++r) {
+    const long long mrow = M ? (mask_shared ? (r % S) : ((long long)head * S + r)) : 0;
     double mx = -1e300;
     for (int t = 0; t < T; ++t) {
       double s = 0;
@@ -499,10 +624,17 @@ static void ref_rows(const __half* Q, const __half* K, const __half* V, int S, i
         s += (double)__half2float(Q[((long long)head * S + r) * 64 + d]) *
              (double)__half2float(K[((long long)head * T + t) * 64 + d]);
       sc[t] = s * scale;
+      if (M) sc[t] += (double)__half2float(M[mrow * T + t]);
       if (sc[t] > mx) mx = sc[t];
     }
     double sum = 0;
-    for (int t = 0; t < T; ++t) { sc[t] = exp(sc[t] - mx); sum += sc[t]; }
+    for (int t = 0; t < T; ++t) {
+      sc[t] = exp(sc[t] - mx);
+      sum += sc[t];
+      if (p_drop > 0.f)
+        sc[t] = af_drop_w_host((float)sc[t], p_drop, drop_scale, seed,
+                               ((long long)head * S + r) * T + t);
+    }
     for (int e = 0; e < 64; ++e) {
       double acc = 0;
       for (int t = 0; t < T; ++t)
@@ -514,7 +646,7 @@ static void ref_rows(const __half* Q, const __half* K, const __half* V, int S, i
 }
 
 typedef void (*attn_kern)(const __half*, const __half*, const __half*, __half*, int, int,
-                          float);
+                          float, const __half*, float, float, unsigned long long, int, int);
 
 // attn32：4096(KV) + 16*1024(P) + 512(ones)
 static const size_t SMEM32 = (4096 + NWT * 1024 + 512) * 2;
@@ -522,21 +654,30 @@ static const size_t SMEM32 = (4096 + NWT * 1024 + 512) * 2;
 static const size_t SMEM64 = (4096 + 4096 + NWT * 1024 + 512) * 2;
 static void run_one(const char* tag, attn_kern kfn, size_t smem, const __half* hQ,
                     const __half* hK, const __half* hV, int bh0, int S, int T, float scale,
-                    int bench_bh) {
-  size_t n = (size_t)bh0 * S * 64, nk = (size_t)bh0 * T * 64;
-  __half *dQ, *dK, *dV, *dO;
+                    int bench_bh, const __half* hM = nullptr, int mask_shared = 0,
+                    float p_drop = 0.f, unsigned long long seed = 0) {
+  const int nrows = bh0 * S;
+  size_t n = (size_t)nrows * 64, nk = (size_t)bh0 * T * 64;
+  __half *dQ, *dK, *dV, *dO, *dM = nullptr;
   cudaMalloc((void**)&dQ, n * 2); cudaMalloc((void**)&dK, nk * 2);
   cudaMalloc((void**)&dV, nk * 2); cudaMalloc((void**)&dO, n * 2);
   cudaMemcpy(dQ, hQ, n * 2, cudaMemcpyHostToDevice);
   cudaMemcpy(dK, hK, nk * 2, cudaMemcpyHostToDevice);
   cudaMemcpy(dV, hV, nk * 2, cudaMemcpyHostToDevice);
+  const int mrows = hM ? (mask_shared ? S : nrows) : 0;
+  if (hM) {
+    cudaMalloc((void**)&dM, (size_t)mrows * T * 2);
+    cudaMemcpy(dM, hM, (size_t)mrows * T * 2, cudaMemcpyHostToDevice);
+  }
   __half* hO = (__half*)malloc(n * 2);
   cudaFuncAttributes at;
   cudaFuncGetAttributes(&at, reinterpret_cast<const void*>(kfn));
   dim3 g0(S / (32 * NWT), bh0);
-  kfn<<<g0, NTH, smem>>>(dQ, dK, dV, dO, S, T, scale);
-  printf("[%s] regs=%d local=%d sync=%d\n", tag, at.numRegs, (int)at.localSizeBytes,
-         (int)cudaDeviceSynchronize());
+  const float drop_scale = p_drop > 0.f ? 1.f / (1.f - p_drop) : 1.f;
+  kfn<<<g0, NTH, smem>>>(dQ, dK, dV, dO, S, T, scale, dM, p_drop, drop_scale, seed,
+                         hM ? 1 : 0, mask_shared);
+  printf("[%s] regs=%d local=%d sync=%d mask=%d drop=%.2f\n", tag, at.numRegs,
+         (int)at.localSizeBytes, (int)cudaDeviceSynchronize(), hM ? mrows : 0, p_drop);
   cudaMemcpy(hO, dO, n * 2, cudaMemcpyDeviceToHost);
 
   double ref[16 * 64], mxerr = 0, mxval = 0;
@@ -545,7 +686,7 @@ static void run_one(const char* tag, attn_kern kfn, size_t smem, const __half* h
   for (int h = 0; h < bh0; ++h) {
     for (int blk = 0; blk < S / 16; ++blk) {
       int r0 = blk * 16;
-      ref_rows(hQ, hK, hV, S, T, h, r0, r0 + 16, scale, ref);
+      ref_rows(hQ, hK, hV, S, T, h, r0, r0 + 16, scale, ref, hM, mask_shared, p_drop, seed);
       for (int i = 0; i < 16 * 64; ++i) {
         double got = (double)__half2float(hO[((long long)h * S + r0 + i / 64) * 64 + i % 64]);
         if (got != got) { ++nbad; continue; }
@@ -557,14 +698,14 @@ static void run_one(const char* tag, attn_kern kfn, size_t smem, const __half* h
       }
     }
   }
-  printf("[%s] max abs err = %.6g (|ref|max = %.4g) bad = %d bad2 = %d/%d\n", tag, mxerr, mxval,
-         nbad, nbad2, (int)n);
+  printf("[%s] max abs err = %.6g (|ref|max = %.4g) bad = %d bad2 = %d/%d\n",
+         tag, mxerr, mxval, nbad, nbad2, (int)n);
   if (mxerr > 0.5) {
     printf("  [%s] worst h=%d row=%d e=%d; per-warp(32行) bad:", tag, wr_h, wr_row, wr_e);
     for (int w = 0; w < 16; ++w) printf(" %d", warpbad[w]);
     printf("\n");
     int hh = wr_h, rr = wr_row;
-    ref_rows(hQ, hK, hV, S, T, hh, rr, rr + 1, scale, ref);
+    ref_rows(hQ, hK, hV, S, T, hh, rr, rr + 1, scale, ref, hM, mask_shared, p_drop, seed);
     for (int e = 0; e < 8; ++e)
       printf("    e=%2d got=%9.5g ref=%9.5g\n", e,
              (double)__half2float(hO[((long long)hh * S + rr) * 64 + e]), ref[e]);
@@ -584,10 +725,14 @@ static void run_one(const char* tag, attn_kern kfn, size_t smem, const __half* h
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0); cudaEventCreate(&e1);
     dim3 g(S / (32 * NWT), bench_bh);
-    for (int i = 0; i < 3; ++i) kfn<<<g, NTH, smem>>>(dQ, dK, dV, dO, S, T, scale);
+    for (int i = 0; i < 3; ++i)
+      kfn<<<g, NTH, smem>>>(dQ, dK, dV, dO, S, T, scale, dM, p_drop, drop_scale, seed,
+                            hM ? 1 : 0, hM ? 1 : 0);
     cudaDeviceSynchronize();
     cudaEventRecord(e0);
-    for (int i = 0; i < reps; ++i) kfn<<<g, NTH, smem>>>(dQ, dK, dV, dO, S, T, scale);
+    for (int i = 0; i < reps; ++i)
+      kfn<<<g, NTH, smem>>>(dQ, dK, dV, dO, S, T, scale, dM, p_drop, drop_scale, seed,
+                            hM ? 1 : 0, hM ? 1 : 0);
     cudaEventRecord(e1);
     cudaEventSynchronize(e1);
     float ms = 0.f;
@@ -598,6 +743,19 @@ static void run_one(const char* tag, attn_kern kfn, size_t smem, const __half* h
   } else {
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
   }
+  if (dM) cudaFree(dM);
+}
+
+// 随机加性 mask：一部分位置 -12（近似屏蔽），其余小值扰动
+static __half* mk_mask(int rows, int T, int seed) {
+  __half* h = mk_gauss((size_t)rows * T, seed, 0.5f);
+  unsigned s = 2654435761u * (unsigned)seed;
+  for (int r = 0; r < rows; ++r)
+    for (int t = 0; t < T; ++t) {
+      s = s * 1664525u + 1013904223u;
+      if (((s >> 20) & 15) == 0) h[(long long)r * T + t] = __float2half(-12.f);
+    }
+  return h;
 }
 
 int main(int argc, char** argv) {
@@ -605,13 +763,29 @@ int main(int argc, char** argv) {
   int T = argc > 3 ? atoi(argv[3]) : 512;
   int bench_bh = argc > 1 ? atoi(argv[1]) : 0;
   float sd = argc > 2 ? (float)atof(argv[2]) : 1.f;
+  const char* md = argc > 4 ? argv[4] : "";
   float scale = 0.125f;
   const int bh0 = 4;
   size_t n = (size_t)bh0 * S * 64, nk = (size_t)bh0 * T * 64;
   __half *hQ = mk_gauss(n, 1, sd), *hK = mk_gauss(nk, 2, sd), *hV = mk_gauss(nk, 3, sd);
-  printf("sd = %.2f  T = %d\n", sd, T);
-  run_one("attn32", attn32, SMEM32, hQ, hK, hV, bh0, S, T, scale, bench_bh);
-  run_one("attn64", attn64, SMEM64, hQ, hK, hV, bh0, S, T, scale, bench_bh);
+  printf("sd = %.2f  T = %d  mode = %s\n", sd, T, md[0] ? md : "plain");
+  const bool use_mask = strchr(md, 'm') != nullptr;
+  const bool use_drop = strchr(md, 'd') != nullptr;
+  const int mask_shared = use_mask && strchr(md, 'f') == nullptr ? 1 : 0;
+  __half* hM = use_mask ? mk_mask(mask_shared ? S : bh0 * S, T, 21) : nullptr;
+  const float p_drop = use_drop ? 0.1f : 0.f;
+  const unsigned long long seed = 12345ULL;
+  if (use_mask || use_drop) {
+    attn_kern k64 = use_mask ? (use_drop ? attn64<true, true> : attn64<true, false>)
+                             : attn64<false, true>;
+    run_one("attn64", k64, SMEM64, hQ, hK, hV, bh0, S, T, scale, bench_bh, hM,
+            mask_shared, p_drop, seed);
+  } else {
+    run_one("attn32", attn32, SMEM32, hQ, hK, hV, bh0, S, T, scale, bench_bh);
+    run_one("attn64", attn64<false, false>, SMEM64, hQ, hK, hV, bh0, S, T, scale,
+            bench_bh);
+  }
   free(hQ); free(hK); free(hV);
+  if (hM) free(hM);
   return 0;
 }

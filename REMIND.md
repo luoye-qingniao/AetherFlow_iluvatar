@@ -668,13 +668,50 @@ half（上限 65504）不会溢出；滞后导致的极小项下溢后反正会�
     P 直填需要大量跨 lane shuffle 重排，比现在的"写 pw + 2 次
     `load_matrix_sync`"更贵。
 
+### mask / dropout 支持（2026-11-22，已跑通）
+
+`attn64` 改成模板 `attn64<HAS_MASK, HAS_DROP>`，编译期消掉运行时分支；bench
+按模式选实例（plain / m / mf / d / md）。
+
+- **必须用特化，不能传运行时 int**：早期用 `int has_mask` 时寄存器压力把
+  `ksm`/`vb` 等挤到 local，spill 496 B，attn64 从 0.67 ms 退化到 **13.77 ms**。
+  模板化后 plain 实例回到 local=8。
+- **mask 是加性**，行索引与包内一致：`r = mask_shared ? (s % S) : (bh*S + s)`，
+  `s = row_base + g*16 + r0 + 4q`。原写法每轮调 8 次 `mask_row()`，其中
+  `gl % S` 是整数除法（每轮 8 次）；改为循环外预计算 `mbase` 一处基址、
+  轮内只用 `kt` 的编译期常量偏移后：m 2.14 → **1.62 ms**（local 252→168），
+  d 1.82 → **1.63 ms**（local 116→28），md 3.17 → **2.54 ms**（local 340→176）。
+- **dropout 与包内 `af_drop_w` 逐位一致**：`idx = (bh*S + s)*T + t`，splitmix64
+  取 `(z>>40)&0xFFFFFF / 2^24`，`u >= p_drop ? p*drop_scale : 0`。索引同样
+  循环外预算基址 `dbase`（`+32` 表示批 B）。
+- **分母同步缩放（关键修复）**：dropout 时分子走累加器 `OF`，慢路径上调基准会
+  给 `OF *= corr`；但分母 `ssr` 是 float 逐轮累加，**也必须乘 corr**，否则旧轮
+  次要的贡献在分母里被高估。漏掉时整个输出偏小（max abs err 6.14，
+  got/ref≈0.037）；补 `if (HAS_DROP && c0 == 0) ssr[...] *= corr;` 后
+  err=0.00335（d）/ 0.00448（md），`bad=0`。
+- **1 block/SM 换 spill 归零不划算**：`__launch_bounds__(NTH, (HAS_MASK||HAS_DROP)?1:2)`
+  能让 local 归零，但 d 2.31 / m 1.90 / md 3.42 ms，全部慢于统一 `(NTH,2)`。
+  最终保持 `(NTH,2)`，接受 168/176 B 的 spill。
+- 各模式实测（512×512×64，bh=256，reps=20，同一编译单元）：
+
+  | 模式 | ms | GFLOPS | regs / local |
+  | --- | --- | --- | --- |
+  | plain | 0.6784 | 50645 | 128 / 8 |
+  | mask（共享 S 行） | 1.6221 | 21182 | 128 / 168 |
+  | dropout | 1.6294 | 21088 | 128 / 28 |
+  | mask + dropout | 2.5386 | 13535 | 128 / 176 |
+
+- 数值：m err 0.00213757、mf 0.0020679、d 0.00335034、md 0.00448257，
+  全部 `bad=0`；plain `T=32/64/96/128/256` 与 attn32 误差一致（约 0.0021）。
+- 剩余成本是 64 位 splitmix64（必须逐位一致，无法简化）与 4 处 mask half 读。
+
 ### 明天接着做
 
 - [x] ~~**验证 Δ 平移**~~ **已放弃**：exp 前统一减 `mn + Δ` 属于
       shared-upper-bound 家族，实测 sd=2 时 P 整行下溢（输出整行 0）、
       sd=4 直接 inf/nan。exact 每行每轮 max 是唯一数值安全的归约方式，
       降频（MR>1）路线整体关闭。
-- [ ] 支持 mask（`[S,T]` 与 `[B,H,S,T]`）与 dropout（RNG 索引语义与现有
+- [x] 支持 mask（`[S,T]` 与 `[B,H,S,T]`）与 dropout（RNG 索引语义与现有
       实现一致）。
 - [ ] 明确回退条件：S/T 非 32 倍数、D≠64 或 E≠64、f32 → 回退物化路径。
 - [ ] 接入 `iluvatar_af`：`_op_attention` 增加 f16 + D=E=64 + `T%32==0`
