@@ -158,11 +158,12 @@ password: orh0GGQ7
       24653 GFLOPS**（18.1 ms 的 13×，已达 522 GB/s 硬下限的 87.5%），
       对拍 7 项 + 全量 conformance 仍 PASS（见"GEMM 物化 attention"一节）
 - [x] TCU flash attention（自写内核，`bench/tcu_flash_attn.cu` + 已接入包内
-      `codegen.py`）：NW=16 + 每轮 64 key + 惰性基准 + **单组 S fragment**
-      （两批串行）。同编译单元实测 plain **0.7111 ms / 48320 GFLOPS**
-      （regs=123 local=0，物化基线的 1.96×）；mask 1.1031、dropout 1.6297、
-      mask+dropout 2.4513，全部 `bad=0`。真机包内 plain 0.7258 ms、四模式
-      NaN=0，全量 conformance 104/7/0、68/68 ops（见"结构定案 + 回填生产包"）
+      `codegen.py`）：**16 warp × 16 行 = 256 行/block、3 block/SM**、每轮
+      64 key + 惰性基准。同编译单元实测 plain **0.6443 ms / 53327 GFLOPS**
+      （regs=79 local=0，物化基线的 2.16×）；mask 0.9551、dropout 1.4436、
+      mask+dropout 1.9972，相对上一轮 32 行结构提升 9%~18%。真机四模式
+      NaN=0、对 f32 参考 maxabs 3.7e-4~4.7e-4，全量 conformance
+      104/7/0、68/68 ops（见"16 行 × 3 block 重构"）
 
 ## 训练层接入（框架侧唯一改动）
 
@@ -797,6 +798,65 @@ bench 文件后续改动前/编译单元不同，bench 未被 git 跟踪、无�
   ≈ 0.45）；md 又比 d 多 0.82 ms（mask 读两遍）。把分母搬进累加器
   （o8/o9）会顶破寄存器（d 2.04 ms / local 220），P 双缓冲超 smem，
   目前没有可行方案。
+
+### 16 行 × 3 block 重构（2026-11-22 第三轮，当前定案）
+
+动机：上一轮 plain 已到 0.7111 ms，但每 block 512 行 × 2 block/SM 时
+串行链（QK → 检测 → exp → 写 P → `__syncwarp` → `load_matrix_sync` → PV）
+没有第二个块来掩盖。把每个 warp 的行数从 32 降到 16，寄存器从 123/128
+压到 79~106，于是 3 个 block 能同时驻留一个 SM。
+
+新结构：`AF_NWT16 = 16` warp × 16 行 = **256 行/block**，`AF_NTH16 = 1024`
+线程，`__launch_bounds__(AF_NTH16, 3)`，动态 smem = 两批 K/V(4×2048)
++ P(`16*512`) + ones(512) = **33792 B**（另加静态 `mls`/`ssums` 各 1 KB；
+3 块合计 107520 B ≤ 131072）。Q 16 行 × 64 列 = 2 个 `matrix_a`；
+S 每批 2 个 accumulator（s0/s1、t0/t1）；P 16×32 = 1 个 `matrix_a`（pa0）；
+OF = o0..o3 分子 + o4 分母。
+
+bench 四模式（512×512×64，bh=256，reps=20，同编译单元）：
+
+| 模式 | 上一轮 32 行 | **16 行 × 3 block** | 提升 | regs/local |
+| --- | --- | --- | --- | --- |
+| plain | 0.7094 | **0.6443** | 9.2% | 79/0 |
+| mask | 1.1005 | **0.9551** | 13.2% | 84/40 |
+| dropout | 1.6286 | **1.4436** | 11.4% | 84/0 |
+| mask+dropout | 2.4503 | **1.9972** | 18.5% | 84/100 |
+
+- mask / mask+dropout 在 3 block 下有 spill（40 / 100 B），但实测仍更快；
+  **不要当 bug 去"修"**。试过把慢路径两个 `q` 循环改 `#pragma unroll 1`：
+  spill 仍是 40 B，且 mask 掉到 1.14 ms（慢 20%），已回滚。
+- 2 block（`__launch_bounds__(_, 2)`）下四模式 local 全 0，数字是
+  0.6441 / 1.0193 / 1.4439 / 2.0342；除 mask 外与 3 block 持平。取 3 block
+  是因为 mask 赢 6.4%、md 赢 1.8%，没有一项变差。
+- 否决项：32 warp / 1 block（0.7196，慢 1.5%，没有第二个块掩盖
+  `__syncthreads`）；8 warp / 4 block（编译器压到 64 寄存器、local=80，
+  1.1410）；P 双缓冲（smem 涨到 48 KB，0.7485）。
+
+回填差异（相对上一轮生产实现）：
+- `af_attn64_plain` 与 `af_attn64_body` **合并**为单个模板
+  `af_attn_w16<HAS_MASK, HAS_DROP>`，四个 `extern "C"` 包装分别实例化
+  `<false,false>` / `<true,false>` / `<false,true>` / `<true,true>`；
+  少一套模板实例，plain 的寄存器预算更宽。
+- 保留 `rb = (row_base < S) ? row_base : 0` 尾行钳位与
+  `if (row_base < S)` 输出保护（S 仍是 32 的倍数，自然满足 16 的倍数）。
+- `backend.py` 的 flash launcher：grid `-(-s_len // 256)`、
+  smem `(4096 + 4096 + 16*512 + 512) * 2`，线程仍是 1024。
+
+真机回归（`install_hardware(..., replace=True)`，B=2,H=8，512×512×64，
+f16 走 flash、f32 走 GEMM 物化作参考）：
+
+| 模式 | f16 NaN/Inf | max abs err vs f32 |
+| --- | --- | --- |
+| plain | 0 | 3.78e-4 |
+| mask | 0 | 3.68e-4 |
+| dropout | 0 | 3.93e-4 |
+| mask+dropout | 0 | 4.66e-4 |
+
+全量 conformance：**104 executed / 7 refused / 0 failed，68/68 ops，PASS**。
+
+剩余性能账：plain 53.3 TFLOPS ≈ 扣掉分母 mma 后上限 74 TFLOPS 的 72%
+（上一轮 65%）；裸 mma 83.4 TFLOPS。剩余缺口仍是每轮的串行链
+（QK → 检测 → exp → 写 P → `__syncwarp` → 装 fragment → PV）与块级同步。
 
 ### 明天接着做
 

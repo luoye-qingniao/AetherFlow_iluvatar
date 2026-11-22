@@ -344,9 +344,9 @@ class IluvatarBackend(DeviceBackend):
                     self.codegen.flash_attention_source(), q.dtype),
                 "af_flash_attn_" + kind,
             )
-            # 16 warp × 32 行 = 每 block 512 行；动态 smem = 两批 K/V + P + ones
+            # 16 warp × 16 行 = 每 block 256 行；动态 smem = 两批 K/V + P + ones
             flash(
-                (-(-s_len // 512), bh),
+                (-(-s_len // 256), bh),
                 (1024,),
                 (
                     q3, k3, v3, out.reshape(bh, s_len, e),
@@ -354,7 +354,7 @@ class IluvatarBackend(DeviceBackend):
                     mask, np.float32(p_drop), drop_scale, seed,
                     np.int32(mask_shared),
                 ),
-                shared_mem=(4096 + 4096 + 16 * 1024 + 512) * 2,
+                shared_mem=(4096 + 4096 + 16 * 512 + 512) * 2,
             )
             return out
         scores = cp.empty((bh, s_len, t_len), dtype=q.dtype)
