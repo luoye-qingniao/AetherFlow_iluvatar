@@ -159,11 +159,11 @@ password: orh0GGQ7
       对拍 7 项 + 全量 conformance 仍 PASS（见"GEMM 物化 attention"一节）
 - [x] TCU flash attention（自写内核，`bench/tcu_flash_attn.cu` + 已接入包内
       `codegen.py`）：**16 warp × 16 行 = 256 行/block、3 block/SM**、每轮
-      64 key + 惰性基准；`load_kv` 按 4 字节搬 K/V。实测 plain
-      **0.5985 ms / 57.4 TFLOPS**（regs=80 local=0，物化基线的 2.33×）；
-      mask 0.9001、dropout 1.4123、mask+dropout 1.9629。真机四模式
-      max_err 6.1e-5~1.22e-4、NaN=0，全量 conformance 104/7/0、68/68 ops
-      （见"load_kv 4 字节化"）
+      64 key + 惰性基准；`load_kv` 按 4 字节搬 K/V；dropout 掩码改用 32 位
+      murmur3。实测 plain **0.5998 ms / 57.3 TFLOPS**（regs=79 local=0，
+      物化基线的 2.33×）；mask 0.9009、dropout **0.8791**、mask+dropout
+      **1.4339**。真机四模式 max_err 4.3e-5~4.6e-5、NaN=0，全量 conformance
+      104/7/0、68/68 ops（见"load_kv 4 字节化"与"dropout RNG 32 位化"）
 
 ## 训练层接入（框架侧唯一改动）
 
@@ -904,6 +904,55 @@ q/k/v 幅度 0.5，f16 输入直接喂图）：四模式 max_err
 的 78%、裸 mma 83.4 TFLOPS 的 69%。纯 mma 数学时间仍只有 0.129 ms，约 77%
 时间花在每 warp 每轮 18 次 fragment 装载、P 的 smem 往返、exp 与块级同步；
 在 16 warp × 3 block 的寄存器/占用率约束下，这几项已无可压缩的余量。
+
+### dropout RNG 32 位化（2026-11-22 第五轮，当前定案）
+
+先测，再改。给 `attn64w16` 加了一个只用于测量的模板参数 `DBG`
+（1=dropout 恒保留、2=跳过预检、3=跳过分母归约），同编译单元对比：
+
+| dropout 变体 | 时间 ms | 结论 |
+| --- | --- | --- |
+| 完整 | 1.4129 | 增量 0.8145 对 plain |
+| 去掉 RNG | 0.7943 | **RNG 占 0.619，即增量的 76%** |
+| 去掉预检 | 1.3541 | 预检 pass 仅 0.059 |
+| 去掉分母归约 | 1.3266 | shfl 归约仅 0.086 |
+
+mask+dropout 同理：完整 1.9620、去掉 RNG 1.2543（差额 0.708 里还含
+local 104→64 B 的 spill 红利）、去掉预检 1.5109、去掉分母归约 1.6779。
+
+结论：dropout 慢的原因不是结构，而是每元素一次 64 位 splitmix——天数没有
+原生 64 位乘法器，`z*C` 要拆成 3 条 32 位乘，整段约 14 条指令/元素，
+67M 元素。无损优化（利用 idx 线性关系把一次乘换成加）天花板只有 2~7%，
+且 84 寄存器已到顶，加常驻累加器必 spill。
+
+改成 32 位 murmur3 finalizer（`h ^= h>>16; h *= 0x85EBCA6B; h ^= h>>13;
+h *= 0xC2B2AE35; h ^= h>>16`，u 取 `h>>8`），指令数减半：
+
+| 模式 | 64 位 splitmix | **32 位 murmur3** | 变化 |
+| --- | --- | --- | --- |
+| plain | 0.5984 | **0.5998** | 持平 |
+| mask | 0.9023 | **0.9009** | 持平 |
+| dropout | 1.4129 | **0.8791** | **-37.8%** |
+| mask+dropout | 1.9620 | **1.4339** | **-26.9%** |
+
+分布质量先在本地用 100 万样本验证：均值 0.5003 / std 0.2885（理想 0.2887）、
+16 bin 最大偏差 0.78%、lag1 相关 7.5e-4、lag16 相关 -2.7e-4、
+`u>=0.1` 保留率 0.9004。与 splitmix 无实质差别。
+
+**语义影响（已确认可接受）**：同一 seed 的 mask 序列会变，但仍是逐元素
+iid Bernoulli，训练复现性只依赖 seed，不依赖跨版本 mask 一致。同步改了
+三处实现：bench 的 device/host 参考、`codegen.py` 的 `attention_rand`、
+两处 inline u 计算。
+
+真机回归：B=2,H=8,512×512×64，q/k/v 幅度 0.5，f16 直接喂图，四模式
+max_err **4.27e-5 / 4.27e-5 / 4.62e-5 / 4.62e-5**，bad=0、NaN/Inf=0；
+全量 conformance **104 executed / 7 refused / 0 failed，68/68 ops，PASS**。
+
+换 hash 后的新拆解（dropout 0.8791）：RNG 只剩 0.084、分母归约 0.136、
+预检 0.079。**mask+dropout 现在的最大单项是预检 pass（0.48 ms，占 1.4339
+的 33%），因为它要为每个元素读一次 mask。** 下一步若要继续压 md，
+要么把 mask 切片缓进 smem，要么改标准 online softmax（每轮 rescale，
+去掉预检）——后者会改变数值路径，需单独验证精度。
 
 ### 明天接着做
 

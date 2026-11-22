@@ -130,13 +130,18 @@ __device__ __forceinline__ float af_block_sum(float v, float* scratch) {
     return r;
 }
 
-__device__ __forceinline__ unsigned long long attention_rand(unsigned long long seed,
-                                                             long long idx) {
-    unsigned long long z =
-        seed + (unsigned long long)idx * 0x9E3779B97F4A7C15ULL;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    return z ^ (z >> 31);
+// dropout 掩码的 32 位 murmur3 finalizer。64 位 splitmix 每次要 3 条 64 位乘
+// （天数上没有原生 64 位乘法器），每元素约 14 条指令；换成 32 位后约减半。
+// 分布与相邻相关性实测与 splitmix 一致，mask 序列变化但仍是 iid Bernoulli。
+__device__ __forceinline__ unsigned attention_rand(unsigned long long seed,
+                                                   long long idx) {
+    unsigned h = (unsigned)idx ^ (unsigned)((unsigned long long)idx >> 32) ^
+                 (unsigned)(seed ^ (seed >> 32));
+    h ^= h >> 16;
+    h *= 0x85EBCA6Bu;
+    h ^= h >> 13;
+    h *= 0xC2B2AE35u;
+    return h ^ (h >> 16);
 }
 """
 
@@ -368,10 +373,10 @@ extern "C" __global__ void attention_fwd(const %T%* __restrict__ q,
             p = expf(sc - m_new);
             w = p;
             if (p_drop > 0.f) {
-                const unsigned long long z =
+                const unsigned z =
                     attention_rand(seed, (bh * S + s) * T + t);
                 const float u =
-                    (float)((z >> 40) & 0xFFFFFFULL) * (1.0f / 16777216.0f);
+                    (float)(z >> 8) * (1.0f / 16777216.0f);
                 w = (u >= p_drop) ? p * drop_scale : 0.f;
             }
         }
@@ -507,8 +512,8 @@ __device__ __forceinline__ float af_sub_sum(float v) {
 // dropout 的 0/1 判定，与融合内核同一约定（同一 seed 逐位相同）。
 __device__ __forceinline__ float af_drop_w(float p, float p_drop, float drop_scale,
                                            unsigned long long seed, long long idx) {
-    const unsigned long long z = attention_rand(seed, idx);
-    const float u = (float)((z >> 40) & 0xFFFFFFULL) * (1.0f / 16777216.0f);
+    const unsigned z = attention_rand(seed, idx);
+    const float u = (float)(z >> 8) * (1.0f / 16777216.0f);
     return (u >= p_drop) ? p * drop_scale : 0.f;
 }
 
@@ -755,8 +760,8 @@ __device__ __forceinline__ float af_flash_drop(float p, float p_drop,
                                                float drop_scale,
                                                unsigned long long seed,
                                                long long idx) {
-  const unsigned long long z = attention_rand(seed, idx);
-  const float u = (float)((z >> 40) & 0xFFFFFFULL) * (1.0f / 16777216.0f);
+  const unsigned z = attention_rand(seed, idx);
+  const float u = (float)(z >> 8) * (1.0f / 16777216.0f);
   return (u >= p_drop) ? p * drop_scale : 0.f;
 }
 

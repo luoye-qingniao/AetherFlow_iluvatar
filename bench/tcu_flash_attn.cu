@@ -64,18 +64,32 @@ __host__ __device__ __forceinline__ int off_col(int row, int col) {
 
 // dropout 的 0/1 判定，与包内 af_drop_w / attention_rand 逐位一致：
 // idx = (bh*S + s) * T + t，u 取 hash 的 24 位高段。
-__device__ __forceinline__ unsigned long long af_rand(unsigned long long seed,
-                                                      long long idx) {
-  unsigned long long z = seed + (unsigned long long)idx * 0x9E3779B97F4A7C15ULL;
-  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-  return z ^ (z >> 31);
+// 32 位 murmur3 finalizer：把两次 64 位乘换成两次 32 位乘，实测分布与
+// 相邻相关和 64 位 splitmix 无差别（100 万样本 bin 偏差 <0.8%，lag1 相关 7e-4）。
+__device__ __forceinline__ unsigned af_rand(unsigned long long seed,
+                                            long long idx) {
+  unsigned h = (unsigned)idx ^ (unsigned)((unsigned long long)idx >> 32) ^
+               (unsigned)(seed ^ (seed >> 32));
+  h ^= h >> 16;
+  h *= 0x85EBCA6Bu;
+  h ^= h >> 13;
+  h *= 0xC2B2AE35u;
+  return h ^ (h >> 16);
 }
 __device__ __forceinline__ float af_drop_w(float p, float p_drop, float drop_scale,
                                            unsigned long long seed, long long idx) {
-  const unsigned long long z = af_rand(seed, idx);
-  const float u = (float)((z >> 40) & 0xFFFFFFULL) * (1.0f / 16777216.0f);
+  const unsigned z = af_rand(seed, idx);
+  const float u = (float)(z >> 8) * (1.0f / 16777216.0f);
   return (u >= p_drop) ? p * drop_scale : 0.f;
+}
+// 探针：DBG=1 时把 dropout 判定换成恒保留，其余代码完全不变，
+// 用来把 hash/分支的成本从 dropout 的额外开销里单独拆出来。
+template <int DBG>
+__device__ __forceinline__ float af_drop_w_dbg(float p, float p_drop,
+                                               float drop_scale,
+                                               unsigned long long seed, long long idx) {
+  if (DBG == 1) return p * drop_scale;
+  return af_drop_w(p, p_drop, drop_scale, seed, idx);
 }
 
 // 加性 mask 的行指针：展平 [bh*S + s, T]；mask_shared 时按 s 取模到 S 行。
@@ -895,7 +909,8 @@ __global__ void __launch_bounds__(NTH, 2) attn64p(
 #define NWT16 16
 #define NTH16 (NWT16 * 64)
 
-template <bool HAS_MASK, bool HAS_DROP>
+// DBG 只是测量探针：1=无 RNG，2=无预检 pass，3=无分母归约。0 为正式内核。
+template <bool HAS_MASK, bool HAS_DROP, int DBG = 0>
 __global__ void __launch_bounds__(NTH16, 3) attn64w16(
     const __half* __restrict__ Q, const __half* __restrict__ K,
     const __half* __restrict__ V, __half* __restrict__ O, int S, int T,
@@ -951,7 +966,8 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
   for (int e = 0; e < 5; ++e) fill_fragment(*OF[e], 0.f);
 
   for (int idx = threadIdx.x; idx < NWT16 * 16; idx += NTH16) {
-    mls[idx] = -1e30f;
+    // DBG=2 删掉预检后不能再用 -1e30 当基准（exp2 会溢出成 inf 干扰计时）
+    mls[idx] = (DBG == 2) ? 0.f : -1e30f;
     ssums[idx] = 0.f;
   }
   for (int idx = threadIdx.x; idx < 512; idx += NTH16) {
@@ -1012,7 +1028,7 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
     // 风险检测单独一遍：dropout（含 mask+dropout）必须在这里、写 P 和累加分母
     // 之前把基准定下来，否则首轮 exp2 溢出成 inf，corr 乘出 NaN。
     // 纯 mask 无此约束，检测并进写 P 的一遍（mask 流量 3 倍 → 1 倍）。
-    if (!HAS_MASK || HAS_DROP) {
+    if ((!HAS_MASK || HAS_DROP) && DBG != 2) {
       bool risk = false;
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
@@ -1081,12 +1097,14 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
       if (HAS_DROP) {
         const long long base = dbase + 4 * q * T + kt;
         float sv = p0 + p1;
-        p0 = af_drop_w(p0, p_drop, drop_scale, seed, base + c0);
-        p1 = af_drop_w(p1, p_drop, drop_scale, seed, base + 16 + c0);
+        p0 = af_drop_w_dbg<DBG>(p0, p_drop, drop_scale, seed, base + c0);
+        p1 = af_drop_w_dbg<DBG>(p1, p_drop, drop_scale, seed, base + 16 + c0);
+        if (DBG != 3) {
 #pragma unroll
-        for (int off = 1; off < 16; off <<= 1)
-          sv += __shfl_xor_sync(0xffffffffu, sv, off);
-        if (c0 == 0) ssr[ri] += sv;
+          for (int off = 1; off < 16; off <<= 1)
+            sv += __shfl_xor_sync(0xffffffffu, sv, off);
+          if (c0 == 0) ssr[ri] += sv;
+        }
       }
       const int row = r0 + 4 * q;
       pw[off_row(row, c0)] = __float2half(p0);
@@ -1154,12 +1172,14 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
         if (HAS_DROP) {
           const long long base = dbase + 4 * q * T + kt + 32;
           float sv = p0 + p1;
-          p0 = af_drop_w(p0, p_drop, drop_scale, seed, base + c0);
-          p1 = af_drop_w(p1, p_drop, drop_scale, seed, base + 16 + c0);
+          p0 = af_drop_w_dbg<DBG>(p0, p_drop, drop_scale, seed, base + c0);
+          p1 = af_drop_w_dbg<DBG>(p1, p_drop, drop_scale, seed, base + 16 + c0);
+          if (DBG != 3) {
 #pragma unroll
-          for (int off = 1; off < 16; off <<= 1)
-            sv += __shfl_xor_sync(0xffffffffu, sv, off);
-          if (c0 == 0) ssr[ri] += sv;
+            for (int off = 1; off < 16; off <<= 1)
+              sv += __shfl_xor_sync(0xffffffffu, sv, off);
+            if (c0 == 0) ssr[ri] += sv;
+          }
         }
         const int row = r0 + 4 * q;
         pw[off_row(row, c0)] = __float2half(p0);
@@ -1211,7 +1231,8 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
   // 归一化放在输出上：(p/l)@V == (p@V)/l。dropout 时 l 是 dropout 前的和。
 #pragma unroll
   for (int q = 0; q < 4; ++q) {
-    const float den = HAS_DROP ? ssr[r0 + 4 * q] : OF[4]->x[q];
+    // DBG=3 没算分母，用 1 代替以避免除零把计时带偏
+    const float den = HAS_DROP ? (DBG == 3 ? 1.f : ssr[r0 + 4 * q]) : OF[4]->x[q];
     const float inv = den != 0.f ? 1.f / den : 0.f;
     const int row = row_base + r0 + 4 * q;
 #pragma unroll
@@ -1239,11 +1260,14 @@ static __half* mk_gauss(size_t n, int seed, float sd) {
 
 static float af_drop_w_host(float p, float p_drop, float drop_scale,
                             unsigned long long seed, long long idx) {
-  unsigned long long z = seed + (unsigned long long)idx * 0x9E3779B97F4A7C15ULL;
-  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-  z ^= z >> 31;
-  const float u = (float)((z >> 40) & 0xFFFFFFULL) * (1.0f / 16777216.0f);
+  unsigned h = (unsigned)idx ^ (unsigned)((unsigned long long)idx >> 32) ^
+               (unsigned)(seed ^ (seed >> 32));
+  h ^= h >> 16;
+  h *= 0x85EBCA6Bu;
+  h ^= h >> 13;
+  h *= 0xC2B2AE35u;
+  h ^= h >> 16;
+  const float u = (float)(h >> 8) * (1.0f / 16777216.0f);
   return (u >= p_drop) ? p * drop_scale : 0.f;
 }
 
@@ -1424,6 +1448,21 @@ int main(int argc, char** argv) {
             mask_shared, p_drop, seed);
     attn_kern kw16 = use_mask ? (use_drop ? attn64w16<true, true> : attn64w16<true, false>)
                               : attn64w16<false, true>;
+    // 探针模式：d1=无 RNG，d2=无预检，d3=无分母归约（只用于拆时间，结果不作数）
+    const char* probe = use_drop ? strpbrk(md, "123") : nullptr;
+    if (probe) {
+      if (*probe == '1')
+        kw16 = use_mask ? attn64w16<true, true, 1> : attn64w16<false, true, 1>;
+      else if (*probe == '2')
+        kw16 = use_mask ? attn64w16<true, true, 2> : attn64w16<false, true, 2>;
+      else
+        kw16 = use_mask ? attn64w16<true, true, 3> : attn64w16<false, true, 3>;
+      run_one("attn64w16", kw16, SMEM16, hQ, hK, hV, bh0, S, T, scale, bench_bh, hM,
+              mask_shared, p_drop, seed, NTH16, 16 * NWT16);
+      free(hQ); free(hK); free(hV);
+      if (hM) free(hM);
+      return 0;
+    }
     run_one("attn64w16", kw16, SMEM16, hQ, hK, hV, bh0, S, T, scale, bench_bh, hM,
             mask_shared, p_drop, seed, NTH16, 16 * NWT16);
   } else {
