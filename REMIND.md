@@ -157,9 +157,10 @@ password: orh0GGQ7
       QK^T → softmax → PV → rescale，512×512×64 降到 **1.394 ms /
       24653 GFLOPS**（18.1 ms 的 13×，已达 522 GB/s 硬下限的 87.5%），
       对拍 7 项 + 全量 conformance 仍 PASS（见"GEMM 物化 attention"一节）
-- [x] TCU flash attention（自写内核，`bench/tcu_flash_attn.cu`）：NW=16 结构、
-      每轮归约的安全档 **0.8309 ms / 41350 GFLOPS**，为物化基线的 1.68×；
-      未接入包内，待验证 Δ 平移 + mask/dropout 后再接（见"TCU flash attention"一节）
+- [x] TCU flash attention（自写内核，`bench/tcu_flash_attn.cu`）：NW=16 + 每轮
+      64 key 合并归约的 attn64 达 **0.6737 ms / 51011 GFLOPS**，为物化基线的
+      2.07×（attn32 基线 0.8284 ms）；未接入包内，待验证 Δ 平移 +
+      mask/dropout 后再接（见"TCU flash attention"一节）
 
 ## 训练层接入（框架侧唯一改动）
 
@@ -557,22 +558,37 @@ core 的 flash 路径。代码在 [bench/tcu_flash_attn.cu](file:///g:/Cloumi/ae
 - 占用：4 blocks/SM × 512 线程要求 regs ≤ 128（262144/(512*4)）；1024 线程
   block 则 2 blocks/SM。
 
-### 结构（NW=16，当前最优且数值安全的版本）
+### 结构（NW=16）
 
 每个 block 1024 线程（16 个 warp），负责**整个头**的 512 行；grid=(1,bh)，
-K/V 每头只搬一次到 smem。SMEM = `(4096 + NWT*1024 + 512)*2` = 41984 B。
-每轮 32 个 key：8 次 mma 出 QK（s00/s01/s10/s11），softmax 就地写进本 warp
-的 P smem（`pw = psm + warp*1024`），10 次 mma 出 PV（o0..o7 + o8/o9 =
-`P@ones` 求分母），末尾按 `inv = 1/den` 归一化写回。
+K/V 每头只搬一次到 smem。每轮一个 tile 的 key 做 8 次 mma 出 QK
+（s00/s01/s10/s11），softmax 就地写进本 warp 的 P smem
+（`pw = psm + warp*1024`），10 次 mma 出 PV（o0..o7 + o8/o9 = `P@ones`
+求分母），末尾按 `inv = 1/den` 归一化写回。
 
-每轮归约的写法（安全档，MR=1）：
+两个内核共用这套结构，区别只在 tile 宽度：
+
+- `attn32`：tile=32 key，每 warp 只占 2 个分数累加器 × 2 行组，smem 41984 B
+  （K/V 各 2048 + P 16×1024 + ones）。数值基线 0.8284 ms。
+- `attn64`：tile=64 key（两批 32），K/V 各留两批（smem 50176 B，仍满足
+  2 block/SM），一次装载一次 `__syncthreads()`；两批 QK 全做完后**一次**
+  4 步 shuffle 覆盖 64 个 key，批 B 的 exp 值先存 `eb[2][4][2]` 寄存器，
+  批 A 的 PV 做完再写回 `pw` 复用。归约密度减半 → 0.6737 ms。
+- 占用门槛：1024 线程/block 时 `regs*1024*2 ≤ 262144` 即 `regs ≤ 128`
+  才能 2 block/SM；attn64 实测 regs=122，余量很小（再加一批分数就掉档，
+  见否决项 6）。
+- exp 走 **log2 空间**：分数直接乘 `scale*log2e`，softmax 用 `__exp2f`，
+  省掉每次 exp 前的乘法；`corr` 无条件乘（不判 `!= 1.f`）。
+
+每轮归约的写法（attn64，log2 空间，4 步覆盖 64 个 key）：
 
 ```cpp
 float mn = ml[g][q], corr = 1.f;
-float mx = fmaxf(x0, x1);
+float mx = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
 for (int off = 1; off < 16; off <<= 1)
     mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
-if (mx > mn) { corr = __expf(mn - mx); mn = mx; ml[g][q] = mx; }
+if (mx > mn) { corr = __exp2f(mn - mx); mn = mx; ml[g][q] = mx; }
+// e0..e3 = __exp2f(x_i - mn)（x_i 已乘 scale*log2e）
 ```
 
 ### 实测（512×512×64，bh=256，reps=20）
@@ -580,15 +596,15 @@ if (mx > mn) { corr = __expf(mn - mx); mn = mx; ml[g][q] = mx; }
 | 变体 | ms | GFLOPS |
 | --- | --- | --- |
 | GEMM 物化基线（当前包内实现） | 1.394 | 24653 |
-| TCU flash NW=8，MR=1 | 1.0188 | — |
-| TCU flash NW=8，MR=4 | 0.8639 | — |
-| **TCU flash NW=16，MR=1（唯一数值安全档，推荐）** | **0.8309** | **41350** |
-| TCU flash NW=16，MR=2 | 0.7322 | 46930 |
-| TCU flash NW=16，MR=4 | 0.6598 | 52070 |
-| TCU flash NW=16，不归约（数值错，仅作上限） | 0.4804 | 71520 |
+| TCU flash attn32（每轮 32 key，精确归约） | 0.8284 | 41475 |
+| **TCU flash attn64（每轮 64 key，两批归约合并）** | **0.6737** | **51011** |
+| attn64 两批不归约（数值错，仅作上限） | 0.4804 | 71520 |
+| 裸 mma 上限 | — | 83370 |
 
-结论：NW=16 + 每轮归约 **0.8309 ms = 物化基线的 1.68×**；`none` 已达裸 mma
-上限的 86%，剩余差主要是 exp（MUFU）与 smem 搬运，且已大量重叠。
+结论：attn64 **0.6737 ms = 物化基线的 2.07×**。理论上限：裸 mma 83.4 TFLOPS
+里分母 mma 固定浪费 2/18 条（11%），扣完约 74 TFLOPS；attn64 的 51 TFLOPS
+= 该上限的 69%，缺口是每 64 key 一次的 4 步 shuffle（8 段 × 4 步）、32 次
+exp2、32 次 P 写 smem 与 2 次 load_matrix_sync，这些都在 TCU 空闲期串行执行。
 注意：**同一编译单元内才有可比性**（多实例编译会整体变慢 10~20%）。
 
 ### 已否决的方向（不要再试）
@@ -603,13 +619,24 @@ if (mx > mn) { corr = __expf(mn - mx); mn = mx; ml[g][q] = mx; }
 5. **`__any_sync` / `__ballot_sync` 门控归约**：`<<<1,64>>>` 探针里
    `__any_sync` 正确、但 `__ballot_sync` 恒返回 0；放进大 block 后数值错
    （err 1.68593）且更慢（0.9726 vs 0.9035 ms）。天数这套 vote intrinsic 不可用。
+6. **attn128（每轮 128 key，4 批合并归约）**：regs 122→154，`154*1024*2 >
+   262144` → 每 SM 只剩 1 个 block，实测 0.8112 ms，比 attn64 慢 20%。
+   要保 2 block/SM 必须 regs ≤ 128，而 16 个分数累加器已占 64 个。
+7. **`-O3`**：0.6793 vs `-O2` 0.6767，无收益。
+8. **K 两批共用 smem 省中间 `__syncthreads()`**：0.6767 vs 0.6728，噪声内略差；
+   结论是块级同步不是瓶颈（代码已简化为一次装载 + 一次同步，保留）。
+9. **`vbo`（P@ones 的 B 片段）外提到循环外只装一次**：regs 118→122，0.6760，
+   无实质变化（保留，代码更短）。
+10. **归约只做 2 步探底**：0.6391 ms（attn32 同期 0.7794）。相对 4 步只值
+    0.037 ms，远小于按模型预期的 0.09 ms → 剩余时间已有相当部分不是 shuffle
+    本身，继续减步数/加 tile 不划算。
 
 ### 明天接着做
 
-- [ ] **验证 Δ 平移**：exp 前统一减 `mn + Δ`（Δ≈4~6）。softmax 平移不变，
-      分子分母同比缩小可抵消，给降频归约留出 half 上界余量；代价是分母低端
-      项下溢（误差 ~3e-6，远低于 f16 精度）。若成立，MR=4 有望安全回到
-      0.66 ms（2.11×）。
+- [x] ~~**验证 Δ 平移**~~ **已放弃**：exp 前统一减 `mn + Δ` 属于
+      shared-upper-bound 家族，实测 sd=2 时 P 整行下溢（输出整行 0）、
+      sd=4 直接 inf/nan。exact 每行每轮 max 是唯一数值安全的归约方式，
+      降频（MR>1）路线整体关闭。
 - [ ] 支持 mask（`[S,T]` 与 `[B,H,S,T]`）与 dropout（RNG 索引语义与现有
       实现一致）。
 - [ ] 明确回退条件：S/T 非 32 倍数、D≠64 或 E≠64、f32 → 回退物化路径。
