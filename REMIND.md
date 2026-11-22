@@ -157,11 +157,12 @@ password: orh0GGQ7
       QK^T → softmax → PV → rescale，512×512×64 降到 **1.394 ms /
       24653 GFLOPS**（18.1 ms 的 13×，已达 522 GB/s 硬下限的 87.5%），
       对拍 7 项 + 全量 conformance 仍 PASS（见"GEMM 物化 attention"一节）
-- [x] TCU flash attention（自写内核，`bench/tcu_flash_attn.cu`）：NW=16 + 每轮
-      64 key + **惰性基准**（`__any_sync` 门控，每 64 key 才可能归约一次）的
-      attn64 达 **0.6725 ms / 51090 GFLOPS**（regs=128 local=0），为物化基线的
-      2.07×（attn32 基线 0.8289 ms）；未接入包内，待补 mask/dropout 后再接
-      （见"TCU flash attention"一节）
+- [x] TCU flash attention（自写内核，`bench/tcu_flash_attn.cu` + 已接入包内
+      `codegen.py`）：NW=16 + 每轮 64 key + 惰性基准 + **单组 S fragment**
+      （两批串行）。同编译单元实测 plain **0.7111 ms / 48320 GFLOPS**
+      （regs=123 local=0，物化基线的 1.96×）；mask 1.1031、dropout 1.6297、
+      mask+dropout 2.4513，全部 `bad=0`。真机包内 plain 0.7258 ms、四模式
+      NaN=0，全量 conformance 104/7/0、68/68 ops（见"结构定案 + 回填生产包"）
 
 ## 训练层接入（框架侧唯一改动）
 
@@ -658,10 +659,12 @@ half（上限 65504）不会溢出；滞后导致的极小项下溢后反正会�
     → 无法在同 block 内做子集同步，这条路线关闭。
     即使可用，smem 也卡在临界：两组各留 2 批 K/V(32 KB) + 各自 P(32 KB)
     + ones(1 KB) = 65 KB > 单 block 65536 B 上限（还要保 2 block/SM）。
-12. **单组 S fragment（批 B 的 QK 排到批 A 的 PV 之后）**：regs=118、
-    local=0（寄存器更宽松），但实测 0.6811 ms，反而比两组 S 慢 1.3%。
-    原因：两批 QK 不再能背靠背发射，TCU 在等批 A 的 exp/PV 时空转，
-    丢掉 ILP。已回退为两组 S。
+12. **单组 S fragment（批 B 的 QK 排到批 A 的 PV 之后）**：早期一次试验
+    （0.6811 vs 0.6725）判为"丢 ILP、更慢"，**后经复现修正**——那次对比
+    混入了别的改动。2026-11-22 重测：两组 S 常驻（两批 QK 前置）时才
+    regs=128 **local=100 B**、0.8151 ms；改成单组 S、两批串行后 regs=123
+    **local=0**、0.7106 ms。**寄存器 spill 的代价远大于两批背靠背的 ILP**，
+    因此 plain 最终采用单组 S 结构（见下节）。
 13. **P 直接填 A fragment、省掉 smem 往返**（读 `iluvatar_mma.hpp` 后静态
     否决，未实测）：A fragment 槽位要的是 `row = 2*r0 / 2*r0+1 / +8 / +9`
     的同列相邻两行，而 accumulator 的行是 `r0 + 4q`，两者映射不一致；
@@ -738,6 +741,63 @@ mask 被整体忽略、dropout 也被整体忽略，而 numerics 看起来"还�
 经验：**内核在独立 bench 正确 ≠ 包内正确**。分派表、模板实参、mask_shared
 这类"胶水层"必须用能改变输出的输入单独验证，不能靠形状/无异常判断。
 
+### 结构定案 + 回填生产包（2026-11-22 第二轮）
+
+起因：包内 plain 仍是 GEMM 物化，bench 里 mask/dropout 虽跑通但未回填。
+复现时发现历史 plain 0.6725 / 0.6784 **本机已不可复现**：取回生产内核源码
+（`_prod.cu`）后确认 `af_attn64_body` 是"两批 QK 前置 + 两组 S fragment"，
+本机实测 0.8151 ms、**local=100 B**。判定为寄存器 spill 主导（历史数字应是
+bench 文件后续改动前/编译单元不同，bench 未被 git 跟踪、无历史版本可回溯）。
+
+定案结构（同一编译单元实测，512×512×64，bh=256，reps=20）：
+
+| 模式 | 结构 | ms | GFLOPS | regs/local |
+| --- | --- | --- | --- | --- |
+| attn32 基线 | 每轮 32 key，精确归约 | 0.8315 | 41323 | 112/0 |
+| plain | **单组 S fragment，两批串行** | **0.7111** | **48320** | 123/0 |
+| mask | 单遍（mask 只读 1 次） | 1.1031 | 31149 | 128/68 |
+| dropout | 预检 + 分母按轮累加 | 1.6297 | 21084 | 128/28 |
+| mask+dropout | 预检 + mask 读两遍 | 2.4513 | 14017 | 128/184 |
+
+- **plain**：批 A 的 QK → 风险检测 → exp/P → PV，批 B 复用同一组 S fragment。
+  `ls` / `vbo` 外提，`ml` 仍在 smem。regs 123、local 0，比两组 S 快 14%。
+- **mask**：不进预检（`HAS_MASK && !HAS_DROP`）时只在写 P 前做一次内联检测，
+  慢路径重算 P 时再读一次 mask；不再每轮单独遍历 mask。gmem mask 读
+  3 次 → 1 次，1.622 → 1.103 ms。
+- **dropout / mask+dropout 必须预检**：首轮 `mlr=-1e30` 时快路径
+  `p=exp2(x+1e30)=inf` 进 `ssr`，慢路径再乘 `corr=0` → `inf*0=NaN`
+  （整块输出 NaN、`bad=131072`）。修法：预检条件 `if (!HAS_MASK || HAS_DROP)`，
+  让带 dropout 的实例第一轮就走慢路径定基准（mask 项也加进预检的两遍扫描）；
+  写 P 的内联检测与逐批慢路径收紧为 `HAS_MASK && !HAS_DROP`。修后 md
+  `bad=0`、err 0.00448257。
+- **回填差异**：新增 `af_attn64_plain(Q,K,V,O,S,T,scale)`（attn64p 的移植，
+  含 `rb` 尾行钳位与 `if (row_base < S)` 输出保护）；模板 `af_attn64_body`
+  换成本轮定案版；`af_flash_attn_plain` 直接调 `af_attn64_plain`，不再实例化
+  `<false,false>`（少一套模板实例抢寄存器预算）。
+
+真机（`install_hardware(..., replace=True)`，`execute_device` + `DeviceArray`，
+20 次均值，含单节点 Python launch 开销）：
+
+| 模式 | ms | NaN |
+| --- | --- | --- |
+| plain | 0.7258 | 0 |
+| mask | 1.3054 | 0 |
+| dropout | 1.6498 | 0 |
+| mask+dropout | 2.6011 | 0 |
+
+- 对拍（B=4,H=8，512×512×64，numpy f32 参考；dropout 用同一 splitmix64 复算）：
+  四模式 maxabs ≤ 6.2e-4，`nan=0`。
+- 全量 conformance：**104 executed / 7 refused / 0 failed，68/68 ops，ok=True**。
+- plain 0.7258 与 bench 0.7111 的差 ≈ 0.015 ms（Python 计划/启动），相对
+  物化基线 1.394 ms 是 **1.92×**。
+- **计时口径**：必须喂 `DeviceArray`（`rt.asarray`）。用 numpy 喂
+  `execute_device` 每轮重新 H2D 三个 16.8 MB 张量 ≈ 3.5 ms，曾得到
+  4.23 ms 的假数字。
+- 剩余成本：d 比 plain 慢 0.92 ms（hash ≈ 0.47 + 每轮 64 次分母 shuffle
+  ≈ 0.45）；md 又比 d 多 0.82 ms（mask 读两遍）。把分母搬进累加器
+  （o8/o9）会顶破寄存器（d 2.04 ms / local 220），P 双缓冲超 smem，
+  目前没有可行方案。
+
 ### 明天接着做
 
 - [x] ~~**验证 Δ 平移**~~ **已放弃**：exp 前统一减 `mn + Δ` 属于
@@ -763,6 +823,11 @@ mask 被整体忽略、dropout 也被整体忽略，而 numerics 看起来"还�
       - `dropout` 与 plain 不逐位相同（maxdiff 1.27），证明 drop 实例真的在用；
       - `mask+dropout` 有限且与 plain 有差异（maxdiff 4.02）；
       - 全量 conformance **104 executed / 7 refused / 0 failed，PASS**。
+- [x] 结构定案（plain 单组 S fragment / mask 单遍 / dropout 预检）→ 回填
+      `codegen.py`（含新增 `af_attn64_plain`）→ 重打包 → 真机四模式对拍
+      maxabs ≤ 6.2e-4、NaN=0 → conformance **104/7/0，68/68 ops**。
+- [x] `bench/tcu_flash_attn.cu` 纳入 git（此前未跟踪，本轮复现历史数字时
+      发现没有版本可回溯，直接导致 0.6725 的结论无法复核）。
 
 ### 本轮随手记的坑
 
