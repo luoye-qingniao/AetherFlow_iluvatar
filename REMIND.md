@@ -65,6 +65,8 @@ warp=64 的影响：现有模板只按 block 内线程索引 + `__syncthreads` �
 
 ## 远端验证机
 
+### 旧机（2026-11-21，已停）
+
 ```
 ssh -p 11155 ubuntu@39.156.149.45
 password: K4QgJolw
@@ -80,6 +82,42 @@ password: K4QgJolw
   export LD_LIBRARY_PATH=$COREX_PATH/lib:$LD_LIBRARY_PATH
   ```
 - 全量测试基线：`Ran 2865 tests` → `OK (skipped=540)`
+
+### 新机（2026-11-22，端口单独下发，机器随用随换）
+
+```
+ssh -p 11161 ubuntu@39.156.149.45
+password: orh0GGQ7
+```
+
+- 新机是**裸镜像 + 只装了驱动**，与旧机不同，不能直接跑包：
+  - `/usr/local/corex-5.0.0` 只有 18 MB：`bin`（ixsmi / logtools /
+    uninstaller）、`lib` 仅 `libcuda.so*` + `libixml.so`；**没有 cudart、
+    cublas、clang++、include**。
+  - 症状：硬件包装得上、`get_backend("iluvatar")` 报
+    `OSError: 找不到天数 CUDA 运行时动态库（libcudart.so.10.2 / .10 / .so）`。
+  - 驱动安装包留在 `/opt/corex-driver-linux64-5.0.0_x86_64.run`（18 MB）。
+- **缺的是 toolkit，需要单独装**（约 1.5 GB+，实测下载 2.5 MB/s）：
+  ```
+  wget https://file-server-software-infra-sh.oss-cn-shanghai.aliyuncs.com/5.0.0/x86_64/sdk/corex-toolkit-linux64-5.0.0_x86_64_10.2.run
+  sudo sh corex-toolkit-linux64-5.0.0_x86_64_10.2.run    # 装完才有 clang++/cudart/cublas
+  ```
+  安装完仍需上面的 `COREX_PATH` / `PATH` / `LD_LIBRARY_PATH` 三行。
+- 重建到"可跑包"的前置步骤（已在本机验证可行，2026-11-22）：
+  1. `python3 -m venv /home/ubuntu/afenv`（镜像自带 pip 24.0，无需 apt）
+  2. `afenv/bin/pip install -U numpy -i https://pypi.tuna.tsinghua.edu.cn/simple`
+     → numpy 2.5.5
+  3. 上传主框架源码（本地 `tar -czf`，排除 `.git` / `__pycache__` / `build`）
+     解到 `/home/ubuntu/aetherflow`，用 `PYTHONPATH=/home/ubuntu/aetherflow`
+     即可 `import aetherflow`（版本 0.1.0，无需 pip install）
+  4. 上传 `dist/iluvatar-0.1.0.zip` →
+     `install_hardware("/home/ubuntu/iluvatar-0.1.0.zip", replace=True)`
+     （新机上验证过：`installed: iluvatar 0.1.0`、`registry: ['iluvatar']`）
+  5. 装 toolkit 后重跑 `get_backend("iluvatar")` 与 conformance
+- 机器 `ixsmi` 显示：`Iluvatar MR-V100`，32768 MiB，1500 MHz，driver 5.0.0，
+  CUDA 10.2，`/dev/iluvatar0` 存在
+- 家目录无 `work` 之外的残留；下载/临时文件已清（`/home/ubuntu` 现只剩
+  `aetherflow`、`afenv`、`iluvatar-0.1.0.zip`）
 
 ## 进度
 
@@ -577,3 +615,7 @@ if (mx > mn) { corr = __expf(mn - mx); mn = mx; ml[g][q] = mx; }
     + 密码推送执行；**用完即删**，结论只留在本文件。
 15. 清理进程曾把 `.git/index.lock` 移进回收站。不要用工具恢复；git 报锁错误
     时直接删掉该锁文件即可。
+16. **天数机器可能是"只装驱动"的裸镜像**：`/usr/local/corex-5.0.0` 仅 18 MB，
+    没有 cudart / cublas / clang++ / include。此时硬件包装得上但
+    `get_backend` 报找不到 `libcudart.so.10.2`。按「远端验证机 → 新机」
+    的链接装 toolkit 再试，不要怀疑硬件包或 manifest。
