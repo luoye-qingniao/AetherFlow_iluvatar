@@ -831,9 +831,13 @@ bench 文件后续改动前/编译单元不同，bench 未被 git 跟踪、无�
 
 ### 本轮随手记的坑
 
-14. **`err = 0` 可能是假象**：输出全 NaN/Inf 时 `fabs(nan - ref) > max` 恒
+14. **用 ALU 近似替换 `exp2f`（省 SFU）**：`bench/exp2_probe.cu` 实测，
+    `exp2f` 吞吐 **1483 Gexp/s（61.8 次/SM/cycle）**，ALU 版（floor + 4 阶
+    FMA + 位构造 2^n，误差 1066 ppm）只有 **439 Gexp/s**，慢 3.4 倍。
+    plain 全问题 67.1M 次 exp2 仅值 **0.045 ms**，SFU 根本不是瓶颈。
+15. **`err = 0` 可能是假象**：输出全 NaN/Inf 时 `fabs(nan - ref) > max` 恒
     false。bench 里要单独数 `if (got != got) ++nbad;`，用 `bad=` 报告。
-15. 探测脚本放在 `%TEMP%`（paramiko，`ssh -p 11161 ubuntu@39.156.149.45`
+16. 探测脚本放在 `%TEMP%`（paramiko，`ssh -p 11161 ubuntu@39.156.149.45`
     / 密码 `orh0GGQ7`）推送执行；`ivc_run.py` 上传 `bench/tcu_flash_attn.cu`
     并用 `/usr/local/corex-5.0.0/bin/clang++` 编译（**必须写绝对路径**，
     PowerShell 会吞 `$COREX_PATH`；也不必先设 PATH）；运行参数 `T<nn>`
