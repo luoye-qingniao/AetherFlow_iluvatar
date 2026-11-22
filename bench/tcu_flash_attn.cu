@@ -88,14 +88,21 @@ __host__ __device__ __forceinline__ const __half* mask_row(const __half* M,
 }
 
 // 32 个 key 的 K/V 重排进 swizzle 布局的 smem。每次 2048 个 half（64x32）。
-// nth 是 block 的线程数：每 warp 16 行的内核用 2048 线程，这里必须跟着变。
+// K 的 swizzle 布局里相邻 d 也相邻（差 1），可按 4 字节整字写；
+// V 的布局相邻 d 差 2，只能标量写两次。每次迭代处理两个 d。
+// nth 是 block 的线程数：每 warp 16 行的内核用 1024 线程，这里必须跟着变。
 __device__ __forceinline__ void load_kv(__half* ks, __half* vs, const __half* Kb0,
                                         const __half* Vb0, int kt, int nth = NTH) {
   const long long o = (long long)kt * 2048;
-  for (int idx = threadIdx.x; idx < 2048; idx += nth) {
-    int t = idx >> 6, d = idx & 63;
-    ks[((t >> 4) * 2 + (d >> 5)) * 512 + off_col(d & 31, t & 15)] = Kb0[o + idx];
-    vs[(d >> 4) * 512 + off_col(t, d & 15)] = Vb0[o + idx];
+  const unsigned* K2 = (const unsigned*)(Kb0 + o);
+  unsigned* ks2 = (unsigned*)ks;
+  for (int idx = threadIdx.x; idx < 1024; idx += nth) {
+    const int t = idx >> 5, d = (idx & 31) * 2;
+    ks2[(((t >> 4) * 2 + (d >> 5)) * 512 + off_col(d & 31, t & 15)) >> 1] = K2[idx];
+    const int g = (t << 6) | d;
+    const __half2 vv = *(const __half2*)(Vb0 + o + g);
+    vs[(d >> 4) * 512 + off_col(t, d & 15)] = __low2half(vv);
+    vs[(d >> 4) * 512 + off_col(t, (d + 1) & 15)] = __high2half(vv);
   }
 }
 

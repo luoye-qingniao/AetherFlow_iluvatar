@@ -159,11 +159,11 @@ password: orh0GGQ7
       对拍 7 项 + 全量 conformance 仍 PASS（见"GEMM 物化 attention"一节）
 - [x] TCU flash attention（自写内核，`bench/tcu_flash_attn.cu` + 已接入包内
       `codegen.py`）：**16 warp × 16 行 = 256 行/block、3 block/SM**、每轮
-      64 key + 惰性基准。同编译单元实测 plain **0.6443 ms / 53327 GFLOPS**
-      （regs=79 local=0，物化基线的 2.16×）；mask 0.9551、dropout 1.4436、
-      mask+dropout 1.9972，相对上一轮 32 行结构提升 9%~18%。真机四模式
-      NaN=0、对 f32 参考 maxabs 3.7e-4~4.7e-4，全量 conformance
-      104/7/0、68/68 ops（见"16 行 × 3 block 重构"）
+      64 key + 惰性基准；`load_kv` 按 4 字节搬 K/V。实测 plain
+      **0.5985 ms / 57.4 TFLOPS**（regs=80 local=0，物化基线的 2.33×）；
+      mask 0.9001、dropout 1.4123、mask+dropout 1.9629。真机四模式
+      max_err 6.1e-5~1.22e-4、NaN=0，全量 conformance 104/7/0、68/68 ops
+      （见"load_kv 4 字节化"）
 
 ## 训练层接入（框架侧唯一改动）
 
@@ -857,6 +857,53 @@ f16 走 flash、f32 走 GEMM 物化作参考）：
 剩余性能账：plain 53.3 TFLOPS ≈ 扣掉分母 mma 后上限 74 TFLOPS 的 72%
 （上一轮 65%）；裸 mma 83.4 TFLOPS。剩余缺口仍是每轮的串行链
 （QK → 检测 → exp → 写 P → `__syncwarp` → 装 fragment → PV）与块级同步。
+
+### load_kv 4 字节化（2026-11-22 第四轮，当前定案）
+
+`load_kv` 原来每线程搬一个 half（2 B gmem 读 + 2 B smem 写，每批两次
+迭代、2048 次）。改成每线程搬两个相邻 d、共 1024 次：
+
+- K 的 swizzle 布局里相邻 d 也相邻（`off_col` 的 **row** 差 1 → 地址 +1），
+  可以一次读 4 B、整字写 smem；
+- V 的布局相邻 d 差 2（`off_col` 的 **col** 差 1 → 地址 +2），只能 4 B 读、
+  拆成两个 half 分两次写。
+
+**踩坑记录：不要假设相邻 d 在 swizzle 布局里一定连续。** 第一次把 V 也
+按 4 B 整字写，结果全错（max_err 10.1、99.9% 元素错位）——`off_col` 的
+row 与 col 两个参数在地址上的步长不对称。
+
+bench 四模式（512×512×64，bh=256，reps=20，同编译单元）：
+
+| 模式 | 16 行 × 3 block | **load_kv 4B** | 提升 | regs/local |
+| --- | --- | --- | --- | --- |
+| plain | 0.6443 | **0.5985** | 7.1% | 80/0 |
+| mask | 0.9551 | **0.9001** | 5.8% | 84/48 |
+| dropout | 1.4436 | **1.4123** | 2.2% | 84/0 |
+| mask+dropout | 1.9972 | **1.9629** | 1.7% | 84/104 |
+
+真机回归（`install_hardware(..., replace=True)`，B=2,H=8，512×512×64，
+q/k/v 幅度 0.5，f16 输入直接喂图）：四模式 max_err
+6.10e-5 / 6.10e-5 / 1.22e-4 / 1.22e-4，NaN/Inf=0；全量 conformance
+**104 executed / 7 refused / 0 failed，68/68 ops，PASS**。
+
+本轮试过并否决（都有实测，勿重试）：
+
+- **8 warp × 16 行**（`__launch_bounds__(512, 4)` / `(512, 5)`）：天数编译器
+  把每线程寄存器压到 **64 / 48**（不是按 `262144/(512×B)` 得到的 128 / 102），
+  spill 84~248 B，四模式 1.1461 / 1.6190 / 2.0855 / 3.4849 与
+  1.4010 / 2.3054 / 2.4738 / 3.8229，全面劣化。**1024 线程 × 3 block 的
+  84 寄存器是无 spill 的最高占用点。**
+- **4 缓冲 K/V 软流水 + 2 block/SM**（smem 50176 B × 2 = 100352 B，每轮把
+  下两批 gmem→smem 提前到本轮 mma 之前发射）：0.7641 / 1.0069 / 1.7083 /
+  2.0244，全部劣于 3 block 双缓冲。说明 gmem 延迟不是瓶颈，2 block 的并发
+  损失更大。（3 缓冲装不下双批预取——会覆盖本轮正在读的 buffer；4 缓冲
+  ×3 block 需要 150528 B > 131072，只能用 2 block。）
+- **V 按 4 B 整字写**：语义错误，见上。
+
+剩余账：plain 0.5985 ms = 57.4 TFLOPS，约是扣掉分母 mma 后上限 74 TFLOPS
+的 78%、裸 mma 83.4 TFLOPS 的 69%。纯 mma 数学时间仍只有 0.129 ms，约 77%
+时间花在每 warp 每轮 18 次 fragment 装载、P 的 smem 往返、exp 与块级同步；
+在 16 warp × 3 block 的寄存器/占用率约束下，这几项已无可压缩的余量。
 
 ### 明天接着做
 

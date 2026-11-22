@@ -735,11 +735,18 @@ __device__ __forceinline__ int af_off_col(int row, int col) {
 __device__ __forceinline__ void af_load_kv(__half* ks, __half* vs,
                                            const __half* Kb0, const __half* Vb0,
                                            int kt, int nth = AF_NTH16) {
+  // 每个线程搬两个相邻 d：K 的 swizzle 布局里相邻 d 也相邻，4 字节整字写；
+  // V 的布局相邻 d 差 2，只能拆成两个 half 写。gmem 侧都是 4 字节读。
   const long long o = (long long)kt * 2048;
-  for (int idx = threadIdx.x; idx < 2048; idx += nth) {
-    int t = idx >> 6, d = idx & 63;
-    ks[((t >> 4) * 2 + (d >> 5)) * 512 + af_off_col(d & 31, t & 15)] = Kb0[o + idx];
-    vs[(d >> 4) * 512 + af_off_col(t, d & 15)] = Vb0[o + idx];
+  const unsigned* K2 = (const unsigned*)(Kb0 + o);
+  unsigned* ks2 = (unsigned*)ks;
+  for (int idx = threadIdx.x; idx < 1024; idx += nth) {
+    const int t = idx >> 5, d = (idx & 31) * 2;
+    ks2[(((t >> 4) * 2 + (d >> 5)) * 512 + af_off_col(d & 31, t & 15)) >> 1] = K2[idx];
+    const int g = (t << 6) | d;
+    const __half2 vv = *(const __half2*)(Vb0 + o + g);
+    vs[(d >> 4) * 512 + af_off_col(t, d & 15)] = __low2half(vv);
+    vs[(d >> 4) * 512 + af_off_col(t, (d + 1) & 15)] = __high2half(vv);
   }
 }
 
