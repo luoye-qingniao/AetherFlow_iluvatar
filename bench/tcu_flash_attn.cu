@@ -1025,10 +1025,11 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
       fill_fragment(t1, -1e30f);
     }
 
-    // 风险检测单独一遍：dropout（含 mask+dropout）必须在这里、写 P 和累加分母
-    // 之前把基准定下来，否则首轮 exp2 溢出成 inf，corr 乘出 NaN。
-    // 纯 mask 无此约束，检测并进写 P 的一遍（mask 流量 3 倍 → 1 倍）。
-    if ((!HAS_MASK || HAS_DROP) && DBG != 2) {
+    // 无 mask 时风险检测单独一遍：不读 mask，只是把 SF/TF 与 scale 重算一次，
+    // 开销比"合并进写 P 的一遍"更低（实测 plain -5%、dropout -29%）。
+    // dropout 也走这条：必须在写 P / 累加分母之前把基准定下来，
+    // 否则首轮基准 -1e30 会让 exp2 溢出成 inf，corr 乘出 NaN。
+    if (!HAS_MASK && DBG != 2) {
       bool risk = false;
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
@@ -1036,15 +1037,6 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
         const float lim = mlr[ri] + 8.f;
         float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
         float x2 = TF[0]->x[q] * sc2, x3 = TF[1]->x[q] * sc2;
-        if (HAS_MASK) {
-          const __half* mr = mbase + (4 * q * T + kt);
-          x0 += __half2float(mr[c0]) * AF_LOG2E;
-          x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
-          if (hasB) {
-            x2 += __half2float(mr[32 + c0]) * AF_LOG2E;
-            x3 += __half2float(mr[48 + c0]) * AF_LOG2E;
-          }
-        }
         risk |= fmaxf(fmaxf(x0, x1), fmaxf(x2, x3)) > lim;
       }
       if (__any_sync(0xffffffffu, risk)) {
@@ -1054,15 +1046,6 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
           const float mn = mlr[ri];
           float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
           float x2 = TF[0]->x[q] * sc2, x3 = TF[1]->x[q] * sc2;
-          if (HAS_MASK) {
-            const __half* mr = mbase + (4 * q * T + kt);
-            x0 += __half2float(mr[c0]) * AF_LOG2E;
-            x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
-            if (hasB) {
-              x2 += __half2float(mr[32 + c0]) * AF_LOG2E;
-              x3 += __half2float(mr[48 + c0]) * AF_LOG2E;
-            }
-          }
           float mx = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
 #pragma unroll
           for (int off = 1; off < 16; off <<= 1)
@@ -1079,9 +1062,19 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
       }
     }
 
-    // 写 P 的一遍：纯 mask 时把检测并进来（risky），其余情况基准已经定好。
+    // 有 mask 时：风险检测并入写 P 的一遍，mask 每轮只读一次。
+    // 越界（旧基准滞后 > 8）时在下面的慢路径按新基准修正 OF / ssr，
+    // 并重写这一批 P；快路径的 p 可能已经很大，但只写进 smem、
+    // 在 load_matrix_sync 之前就被覆盖，不会被消费。
     __syncwarp();
     bool risky = false;
+    // 首轮基准是 -1e30，p 会溢出成 inf。纯 mask 时首轮跳过快路径最省
+    // （慢路径必然全量重算）；dropout 时快路径的 hash 也要重做，实测
+    // "先算一遍 + 慢路径覆盖" 反而更快（寄存器分配更好），故不跳过。
+    // DBG==2 的探针必须保留快路径（只有它写 pw）。
+    const bool firstq = (kt == 0) && DBG != 2;
+    const bool first = HAS_MASK && !HAS_DROP && firstq;
+    if (!first) {
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
       const int ri = r0 + 4 * q;
@@ -1092,7 +1085,10 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
         x0 += __half2float(mr[c0]) * AF_LOG2E;
         x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
       }
-      if (HAS_MASK && !HAS_DROP) risky |= fmaxf(x0, x1) > mn + 8.f;
+      if (HAS_MASK && DBG != 2) risky |= fmaxf(x0, x1) > mn + 8.f;
+      // 不 clamp：首轮的 inf 只会进 pw/ssr，这两处都会被慢路径覆盖；
+      // 其余轮次越界幅度有限（log2 空间十几个数量级），不会溢出。
+      // 这样快路径的旧贡献缩放后与新基准的贡献严格相等，慢路径只需缩放。
       float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
       if (HAS_DROP) {
         const long long base = dbase + 4 * q * T + kt;
@@ -1110,32 +1106,57 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
       pw[off_row(row, c0)] = __float2half(p0);
       pw[off_row(row, 16 + c0)] = __float2half(p1);
     }
-    // 纯 mask 的慢路径：上面用旧基准算了一遍，若越界就按新基准重算重写。
-    if (HAS_MASK && !HAS_DROP) {
-      if (__any_sync(0xffffffffu, risky)) {
+    }
+    // 慢路径：上面用旧基准算了一遍，若越界就按新基准修正并重写这一批 P。
+    // 分母在快路径里已把旧值累加进去，乘 corr 即等于按新基准重算；
+    // 首轮基准是 -1e30，快路径的 p 被 clamp 成有限值，corr 恰为 0 时归零。
+    // 注意：不能按 q 提前 continue——不同行组越界情况不同，跳过的 lane 会
+    // 缺席后续 shfl 归约。这里所有 lane 都执行，只用 fix 谓词控制分母写回。
+    if (HAS_MASK && DBG != 2) {
+      if (firstq || __any_sync(0xffffffffu, risky)) {
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
           const int ri = r0 + 4 * q;
           float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
-          const __half* mr = mbase + (4 * q * T + kt);
-          x0 += __half2float(mr[c0]) * AF_LOG2E;
-          x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
+          if (HAS_MASK) {
+            const __half* mr = mbase + (4 * q * T + kt);
+            x0 += __half2float(mr[c0]) * AF_LOG2E;
+            x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
+          }
           float mn = mlr[ri], corr = 1.f;
           float mx = fmaxf(x0, x1);
 #pragma unroll
           for (int off = 1; off < 16; off <<= 1)
             mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
-          if (mx > mn) {
+          const bool fix = mx > mn || first;
+          if (fix) {
             corr = exp2f(mn - mx);
             mlr[ri] = mx;
             mn = mx;
           }
 #pragma unroll
           for (int e = 0; e < 5; ++e) OF[e]->x[q] *= corr;
-          const float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
-          const int row = r0 + 4 * q;
-          pw[off_row(row, c0)] = __float2half(p0);
-          pw[off_row(row, 16 + c0)] = __float2half(p1);
+          float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
+          if (HAS_DROP) {
+            const long long base = dbase + 4 * q * T + kt;
+            float sv = p0 + p1;
+            p0 = af_drop_w_dbg<DBG>(p0, p_drop, drop_scale, seed, base + c0);
+            p1 = af_drop_w_dbg<DBG>(p1, p_drop, drop_scale, seed, base + 16 + c0);
+            if (DBG != 3) {
+#pragma unroll
+              for (int off = 1; off < 16; off <<= 1)
+                sv += __shfl_xor_sync(0xffffffffu, sv, off);
+              // 快路径已把本轮旧基准的值累加进去，乘 corr 缩放到新基准即可。
+              // 首轮（firstq）快路径写进去的是 inf，必须直接取 sv 覆盖。
+              if (c0 == 0 && (fix || firstq)) ssr[ri] = firstq ? sv : ssr[ri] * corr;
+            }
+          }
+          // 首轮跳过了快路径，即使本行全是 -inf（mx 不提升）也必须写 pw。
+          if (fix || firstq) {
+            const int row = r0 + 4 * q;
+            pw[off_row(row, c0)] = __float2half(p0);
+            pw[off_row(row, 16 + c0)] = __float2half(p1);
+          }
         }
       }
     }
@@ -1157,6 +1178,7 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
       // 批 B 的 P 在这里现算（不占暂存寄存器），pw 已空出；结构与批 A 相同。
       __syncwarp();
       risky = false;
+      if (!first) {
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
         const int ri = r0 + 4 * q;
@@ -1167,7 +1189,7 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
           x0 += __half2float(mr[32 + c0]) * AF_LOG2E;
           x1 += __half2float(mr[48 + c0]) * AF_LOG2E;
         }
-        if (HAS_MASK && !HAS_DROP) risky |= fmaxf(x0, x1) > mn + 8.f;
+        if (HAS_MASK && DBG != 2) risky |= fmaxf(x0, x1) > mn + 8.f;
         float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
         if (HAS_DROP) {
           const long long base = dbase + 4 * q * T + kt + 32;
@@ -1185,31 +1207,52 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
         pw[off_row(row, c0)] = __float2half(p0);
         pw[off_row(row, 16 + c0)] = __float2half(p1);
       }
-      if (HAS_MASK && !HAS_DROP) {
-        if (__any_sync(0xffffffffu, risky)) {
+      }
+      if (HAS_MASK && DBG != 2) {
+        if (firstq || __any_sync(0xffffffffu, risky)) {
 #pragma unroll
           for (int q = 0; q < 4; ++q) {
             const int ri = r0 + 4 * q;
             float x0 = TF[0]->x[q] * sc2, x1 = TF[1]->x[q] * sc2;
-            const __half* mr = mbase + (4 * q * T + kt);
-            x0 += __half2float(mr[32 + c0]) * AF_LOG2E;
-            x1 += __half2float(mr[48 + c0]) * AF_LOG2E;
+            if (HAS_MASK) {
+              const __half* mr = mbase + (4 * q * T + kt);
+              x0 += __half2float(mr[32 + c0]) * AF_LOG2E;
+              x1 += __half2float(mr[48 + c0]) * AF_LOG2E;
+            }
             float mn = mlr[ri], corr = 1.f;
             float mx = fmaxf(x0, x1);
 #pragma unroll
             for (int off = 1; off < 16; off <<= 1)
               mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
-            if (mx > mn) {
+            const bool fix = mx > mn || first;
+            if (fix) {
               corr = exp2f(mn - mx);
               mlr[ri] = mx;
               mn = mx;
             }
 #pragma unroll
             for (int e = 0; e < 5; ++e) OF[e]->x[q] *= corr;
-            const float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
-            const int row = r0 + 4 * q;
-            pw[off_row(row, c0)] = __float2half(p0);
-            pw[off_row(row, 16 + c0)] = __float2half(p1);
+            float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
+            if (HAS_DROP) {
+              const long long base = dbase + 4 * q * T + kt + 32;
+              float sv = p0 + p1;
+              p0 = af_drop_w_dbg<DBG>(p0, p_drop, drop_scale, seed, base + c0);
+              p1 = af_drop_w_dbg<DBG>(p1, p_drop, drop_scale, seed, base + 16 + c0);
+              if (DBG != 3) {
+#pragma unroll
+                for (int off = 1; off < 16; off <<= 1)
+                  sv += __shfl_xor_sync(0xffffffffu, sv, off);
+                // dropout（HAS_DROP）时批 B 的快路径一定执行过，且批 A 的慢路径
+                // 已把基准定为有效值，快路径累加的是有效贡献 —— 这里只需缩放；
+                // 若首轮再 +sv 会把本批算两遍（实测 md 误差 2.9）。
+                if (c0 == 0 && (fix || firstq)) ssr[ri] = ssr[ri] * corr;
+              }
+            }
+            if (fix || firstq) {
+              const int row = r0 + 4 * q;
+              pw[off_row(row, c0)] = __float2half(p0);
+              pw[off_row(row, 16 + c0)] = __float2half(p1);
+            }
           }
         }
       }
@@ -1372,9 +1415,11 @@ static void run_one(const char* tag, attn_kern kfn, size_t smem, const __half* h
     printf("\n");
     int hh = wr_h, rr = wr_row;
     ref_rows(hQ, hK, hV, S, T, hh, rr, rr + 1, scale, ref, hM, mask_shared, p_drop, seed);
-    for (int e = 0; e < 8; ++e)
-      printf("    e=%2d got=%9.5g ref=%9.5g\n", e,
-             (double)__half2float(hO[((long long)hh * S + rr) * 64 + e]), ref[e]);
+    for (int e = 0; e < 8; ++e) {
+      double gv = (double)__half2float(hO[((long long)hh * S + rr) * 64 + e]);
+      printf("    e=%2d got=%9.5g ref=%9.5g r=%9.5f\n", e, gv, ref[e],
+             ref[e] != 0.0 ? gv / ref[e] : 0.0);
+    }
   }
   free(hO);
 

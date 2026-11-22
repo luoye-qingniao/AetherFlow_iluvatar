@@ -706,14 +706,14 @@ extern "C" __global__ void af_attention_rescale(
 # TCU flash attention（f16，D=E=64）。
 #
 # 与 ``attention_scores_source`` 的 GEMM 物化路径并列：Q/K/V 只在开始时读一次
-# HBM，分数矩阵永不落显存。结构来自 bench/tcu_flash_attn.cu 的 attn64：
-# 每 block 16 warp × 32 行 = 512 行、每轮 64 key（两批 32），softmax 用
+# HBM，分数矩阵永不落显存。结构来自 bench/tcu_flash_attn.cu 的 attn64w16：
+# 每 block 16 warp × 16 行 = 256 行、每轮 64 key（两批 32），softmax 用
 # **惰性基准**（只有分数超出基准 8（log2 空间）时才 4 步 shuffle 重算），
 # 分母非 dropout 时走 P@ones 的 mma、dropout 时走 warp 内 shuffle 求和。
 #
 # 四个模式编译成四个非模板启动器（``extern "C"``，便于 cuModuleGetFunction
 # 按固定名字取），模板实例化后内联，寄存器分配与 bench 完全一致。
-# 行方向允许 S 不是 512 的倍数：越界的 warp 照常参与块级同步，但只读第 0 行
+# 行方向允许 S 不是 256 的倍数：越界的 warp 照常参与块级同步，但只读第 0 行
 # 且不写输出（S 必须是 32 的倍数才能整 warp 判定）。
 _ILUVATAR_FLASH_SRC = "%PRELUDE%" + _ILUVATAR_ATTN_HELPERS + r"""
 #include <crt/iluvatar_mma.h>
@@ -767,20 +767,24 @@ __device__ __forceinline__ float af_flash_drop(float p, float p_drop,
 
 // ---------------------------------------------------------------------
 // 一个模板覆盖四个模式：16 warp × 16 行 = 每 block 256 行，每轮 64 key
-// （两批 32 背靠背发射以取 ILP）。行数减半后寄存器从 123/128 降到
-// 79~106，四种模式的 local 全为 0；`__launch_bounds__(_, 3)` 让 3 个
-// block 共存于一个 SM，两个块互相掩盖 __syncthreads 与 K/V 装载的空泡。
-// bench 四模式（512x512x64, bh=256）对比 32 行版本：
-//   plain 0.710 → 0.644、mask 1.100 → 0.955、drop 1.629 → 1.444、
-//   mask+drop 2.451 → 1.997 ms。
+// （两批 32 背靠背发射以取 ILP）。行数减半后 OF 只剩 5 个 accumulator，
+// 双批 S 能真正背靠背；`__launch_bounds__(_, 3)` 让 3 个 block 共存于
+// 一个 SM，互相掩盖 __syncthreads 与 K/V 装载的空泡。
+// bench 四模式（512x512x64, bh=256）最终值 / 32 行版本（HEAD b4c21a5）：
+//   plain 0.5996 / 0.5998、mask 0.8481 / 0.9009、
+//   drop 0.8812 / 0.8791、mask+drop 1.2721 / 1.4339 ms。
 // 纯 mask 的慢路径保持展开：改成 unroll 1 会重新 spill 且慢 20%。
 //
-// 两种 mask/dropout 结构按 HAS_DROP 选：
-//   * 纯 mask：风险检测并进写 P 的一遍（mask 每元素每轮只读一次），
-//     命中时用慢路径按新基准重写 P。
-//   * dropout（含 mask+dropout）：风险检测必须先独立跑一遍。分母 ssr 是
-//     float 逐轮累加，若先按初始基准 -1e30 写 P，exp2 溢出成 inf，慢路径
-//     再乘 corr=0 就是 NaN；预检保证首轮的 inf 不进 ssr。
+// 两种 mask/dropout 结构按 HAS_MASK 选：
+//   * !HAS_MASK（plain / dropout）：风险检测先独立跑一遍——只用 SF/TF 与
+//     sc2 重算 4 行分数、检测 lim = mlr + 8；越界则 shfl 归约新基准、缩放
+//     OF 与 ssr。dropout 必须走这条：分母 ssr 是 float 逐轮累加，若先按
+//     初始基准 -1e30 写 P，exp2 溢出成 inf，慢路径再乘 corr=0 就是 NaN；
+//     预检保证首轮的 inf 不进 ssr。
+//   * HAS_MASK（mask / mask+dropout）：检测并入写 P 的一遍（mask 每元素
+//     每轮只读一次），命中时慢路径按新基准修正 OF / ssr 并重写 P。
+//     首轮基准是 -1e30：纯 mask 跳过快路径（慢路径必然全量重算）；
+//     mask+drop 不跳过——快路径的 hash 也要在慢路径重做，实测反而更快。
 template <bool HAS_MASK, bool HAS_DROP>
 __device__ __forceinline__ void af_attn_w16(
     const __half* __restrict__ Q, const __half* __restrict__ K,
@@ -897,10 +901,11 @@ __device__ __forceinline__ void af_attn_w16(
       fill_fragment(t1, -1e30f);
     }
 
-    // 风险检测单独一遍：dropout（含 mask+dropout）必须在这里、写 P 和累加
-    // 分母之前把基准定下来，否则首轮 exp2 溢出成 inf，corr 乘出 NaN。
-    // 纯 mask 无此约束，检测并进写 P 的一遍（mask 流量 3 倍 → 1 倍）。
-    if (!HAS_MASK || HAS_DROP) {
+    // 无 mask 时风险检测单独一遍：不读 mask，只把 SF/TF 与 scale 重算一次，
+    // 开销比"合并进写 P 的一遍"更低（实测 plain -5%、dropout -29%）。
+    // dropout 必须走这条：分母 ssr 是 float 逐轮累加，基准必须先定下来，
+    // 否则首轮 exp2 溢出成 inf，corr 乘出 NaN。
+    if (!HAS_MASK) {
       bool risk = false;
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
@@ -908,15 +913,6 @@ __device__ __forceinline__ void af_attn_w16(
         const float lim = mlr[ri] + 8.f;
         float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
         float x2 = TF[0]->x[q] * sc2, x3 = TF[1]->x[q] * sc2;
-        if (HAS_MASK) {
-          const __half* mr = mbase + (4 * q * T + kt);
-          x0 += __half2float(mr[c0]) * AF_LOG2E;
-          x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
-          if (hasB) {
-            x2 += __half2float(mr[32 + c0]) * AF_LOG2E;
-            x3 += __half2float(mr[48 + c0]) * AF_LOG2E;
-          }
-        }
         risk |= fmaxf(fmaxf(x0, x1), fmaxf(x2, x3)) > lim;
       }
       if (__any_sync(0xffffffffu, risk)) {
@@ -926,15 +922,6 @@ __device__ __forceinline__ void af_attn_w16(
           const float mn = mlr[ri];
           float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
           float x2 = TF[0]->x[q] * sc2, x3 = TF[1]->x[q] * sc2;
-          if (HAS_MASK) {
-            const __half* mr = mbase + (4 * q * T + kt);
-            x0 += __half2float(mr[c0]) * AF_LOG2E;
-            x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
-            if (hasB) {
-              x2 += __half2float(mr[32 + c0]) * AF_LOG2E;
-              x3 += __half2float(mr[48 + c0]) * AF_LOG2E;
-            }
-          }
           float mx = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
 #pragma unroll
           for (int off = 1; off < 16; off <<= 1)
@@ -951,61 +938,93 @@ __device__ __forceinline__ void af_attn_w16(
       }
     }
 
-    // 写 P 的一遍：纯 mask 时把检测并进来（risky），其余情况基准已经定好。
+    // 有 mask 时：风险检测并入写 P 的一遍，mask 每轮只读一次。
+    // 越界（旧基准滞后 > 8）时在下面的慢路径按新基准修正 OF / ssr 并重写
+    // 这一批 P；快路径的 p 可能已经很大，但只写进 pw、在 load_matrix_sync
+    // 之前就被覆盖，不会被消费。
     __syncwarp();
     bool risky = false;
+    // 首轮基准是 -1e30，p 会溢出成 inf。纯 mask 时首轮跳过快路径最省
+    // （慢路径必然全量重算）；mask+dropout 时快路径的 hash 也要重做，实测
+    // "先算一遍 + 慢路径覆盖" 反而更快（寄存器分配更好），故不跳过。
+    const bool firstq = (kt == 0);
+    const bool first = HAS_MASK && !HAS_DROP && firstq;
+    if (!first) {
 #pragma unroll
-    for (int q = 0; q < 4; ++q) {
-      const int ri = r0 + 4 * q;
-      const float mn = mlr[ri];
-      float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
-      if (HAS_MASK) {
-        const __half* mr = mbase + (4 * q * T + kt);
-        x0 += __half2float(mr[c0]) * AF_LOG2E;
-        x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
-      }
-      if (HAS_MASK && !HAS_DROP) risky |= fmaxf(x0, x1) > mn + 8.f;
-      float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
-      if (HAS_DROP) {
-        const long long base = dbase + 4 * q * T + kt;
-        float sv = p0 + p1;
-        p0 = af_flash_drop(p0, p_drop, drop_scale, seed, base + c0);
-        p1 = af_flash_drop(p1, p_drop, drop_scale, seed, base + 16 + c0);
+      for (int q = 0; q < 4; ++q) {
+        const int ri = r0 + 4 * q;
+        const float mn = mlr[ri];
+        float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
+        if (HAS_MASK) {
+          const __half* mr = mbase + (4 * q * T + kt);
+          x0 += __half2float(mr[c0]) * AF_LOG2E;
+          x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
+        }
+        if (HAS_MASK) risky |= fmaxf(x0, x1) > mn + 8.f;
+        // 不 clamp：首轮的 inf 只会进 pw/ssr，这两处都会被慢路径覆盖；
+        // 其余轮次越界幅度有限（log2 空间十几个数量级），不会溢出。
+        float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
+        if (HAS_DROP) {
+          const long long base = dbase + 4 * q * T + kt;
+          float sv = p0 + p1;
+          p0 = af_flash_drop(p0, p_drop, drop_scale, seed, base + c0);
+          p1 = af_flash_drop(p1, p_drop, drop_scale, seed, base + 16 + c0);
 #pragma unroll
-        for (int off = 1; off < 16; off <<= 1)
-          sv += __shfl_xor_sync(0xffffffffu, sv, off);
-        if (c0 == 0) ssr[ri] += sv;
+          for (int off = 1; off < 16; off <<= 1)
+            sv += __shfl_xor_sync(0xffffffffu, sv, off);
+          if (c0 == 0) ssr[ri] += sv;
+        }
+        const int row = r0 + 4 * q;
+        pw[af_off_row(row, c0)] = __float2half(p0);
+        pw[af_off_row(row, 16 + c0)] = __float2half(p1);
       }
-      const int row = r0 + 4 * q;
-      pw[af_off_row(row, c0)] = __float2half(p0);
-      pw[af_off_row(row, 16 + c0)] = __float2half(p1);
     }
-    // 纯 mask 的慢路径：上面用旧基准算了一遍，若越界就按新基准重算重写。
-    if (HAS_MASK && !HAS_DROP) {
-      if (__any_sync(0xffffffffu, risky)) {
+    // 慢路径：上面用旧基准算了一遍，若越界就按新基准修正并重写这一批 P。
+    // 分母在快路径里已把旧值累加进去，乘 corr 即等于按新基准重算；
+    // 首轮（firstq）快路径写进去的是 inf，必须直接取 sv 覆盖。
+    // 注意：不能按 q 提前 continue——不同行组越界情况不同，跳过的 lane 会
+    // 缺席后续 shfl 归约。这里所有 lane 都执行，只用 fix 谓词控制写回。
+    if (HAS_MASK) {
+      if (firstq || __any_sync(0xffffffffu, risky)) {
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
           const int ri = r0 + 4 * q;
           float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
-          const __half* mr = mbase + (4 * q * T + kt);
-          x0 += __half2float(mr[c0]) * AF_LOG2E;
-          x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
+          {
+            const __half* mr = mbase + (4 * q * T + kt);
+            x0 += __half2float(mr[c0]) * AF_LOG2E;
+            x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
+          }
           float mn = mlr[ri], corr = 1.f;
           float mx = fmaxf(x0, x1);
 #pragma unroll
           for (int off = 1; off < 16; off <<= 1)
             mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
-          if (mx > mn) {
+          const bool fix = mx > mn || first;
+          if (fix) {
             corr = exp2f(mn - mx);
             mlr[ri] = mx;
             mn = mx;
           }
 #pragma unroll
           for (int e = 0; e < 5; ++e) OF[e]->x[q] *= corr;
-          const float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
-          const int row = r0 + 4 * q;
-          pw[af_off_row(row, c0)] = __float2half(p0);
-          pw[af_off_row(row, 16 + c0)] = __float2half(p1);
+          float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
+          if (HAS_DROP) {
+            const long long base = dbase + 4 * q * T + kt;
+            float sv = p0 + p1;
+            p0 = af_flash_drop(p0, p_drop, drop_scale, seed, base + c0);
+            p1 = af_flash_drop(p1, p_drop, drop_scale, seed, base + 16 + c0);
+#pragma unroll
+            for (int off = 1; off < 16; off <<= 1)
+              sv += __shfl_xor_sync(0xffffffffu, sv, off);
+            if (c0 == 0 && (fix || firstq)) ssr[ri] = firstq ? sv : ssr[ri] * corr;
+          }
+          // 首轮跳过了快路径，即使本行全是 -inf（mx 不提升）也必须写 pw。
+          if (fix || firstq) {
+            const int row = r0 + 4 * q;
+            pw[af_off_row(row, c0)] = __float2half(p0);
+            pw[af_off_row(row, 16 + c0)] = __float2half(p1);
+          }
         }
       }
     }
@@ -1027,6 +1046,7 @@ __device__ __forceinline__ void af_attn_w16(
       // 批 B 的 P 在这里现算（不占暂存寄存器），pw 已空出；结构与批 A 相同。
       __syncwarp();
       risky = false;
+      if (!first) {
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
         const int ri = r0 + 4 * q;
@@ -1037,7 +1057,7 @@ __device__ __forceinline__ void af_attn_w16(
           x0 += __half2float(mr[32 + c0]) * AF_LOG2E;
           x1 += __half2float(mr[48 + c0]) * AF_LOG2E;
         }
-        if (HAS_MASK && !HAS_DROP) risky |= fmaxf(x0, x1) > mn + 8.f;
+        if (HAS_MASK) risky |= fmaxf(x0, x1) > mn + 8.f;
         float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
         if (HAS_DROP) {
           const long long base = dbase + 4 * q * T + kt + 32;
@@ -1053,31 +1073,51 @@ __device__ __forceinline__ void af_attn_w16(
         pw[af_off_row(row, c0)] = __float2half(p0);
         pw[af_off_row(row, 16 + c0)] = __float2half(p1);
       }
-      if (HAS_MASK && !HAS_DROP) {
-        if (__any_sync(0xffffffffu, risky)) {
+      }
+      if (HAS_MASK) {
+        if (firstq || __any_sync(0xffffffffu, risky)) {
 #pragma unroll
           for (int q = 0; q < 4; ++q) {
             const int ri = r0 + 4 * q;
             float x0 = TF[0]->x[q] * sc2, x1 = TF[1]->x[q] * sc2;
-            const __half* mr = mbase + (4 * q * T + kt);
-            x0 += __half2float(mr[32 + c0]) * AF_LOG2E;
-            x1 += __half2float(mr[48 + c0]) * AF_LOG2E;
+            {
+              const __half* mr = mbase + (4 * q * T + kt);
+              x0 += __half2float(mr[32 + c0]) * AF_LOG2E;
+              x1 += __half2float(mr[48 + c0]) * AF_LOG2E;
+            }
             float mn = mlr[ri], corr = 1.f;
             float mx = fmaxf(x0, x1);
 #pragma unroll
             for (int off = 1; off < 16; off <<= 1)
               mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
-            if (mx > mn) {
+            const bool fix = mx > mn || first;
+            if (fix) {
               corr = exp2f(mn - mx);
               mlr[ri] = mx;
               mn = mx;
             }
 #pragma unroll
             for (int e = 0; e < 5; ++e) OF[e]->x[q] *= corr;
-            const float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
-            const int row = r0 + 4 * q;
-            pw[af_off_row(row, c0)] = __float2half(p0);
-            pw[af_off_row(row, 16 + c0)] = __float2half(p1);
+            float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
+            if (HAS_DROP) {
+              const long long base = dbase + 4 * q * T + kt + 32;
+              float sv = p0 + p1;
+              p0 = af_flash_drop(p0, p_drop, drop_scale, seed, base + c0);
+              p1 = af_flash_drop(p1, p_drop, drop_scale, seed, base + 16 + c0);
+#pragma unroll
+              for (int off = 1; off < 16; off <<= 1)
+                sv += __shfl_xor_sync(0xffffffffu, sv, off);
+              // 批 B 的快路径一定执行过（first 只在纯 mask 首轮为真，而纯
+              // mask 没有分母），且批 A 的慢路径已把基准定为有效值，快路径
+              // 累加的是有效贡献 —— 这里只需缩放；若首轮再 +sv 会把本批
+              // 算两遍（实测 md 误差 2.9）。
+              if (c0 == 0 && (fix || firstq)) ssr[ri] = ssr[ri] * corr;
+            }
+            if (fix || firstq) {
+              const int row = r0 + 4 * q;
+              pw[af_off_row(row, c0)] = __float2half(p0);
+              pw[af_off_row(row, 16 + c0)] = __float2half(p1);
+            }
           }
         }
       }

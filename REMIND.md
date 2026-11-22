@@ -160,10 +160,11 @@ password: orh0GGQ7
 - [x] TCU flash attention（自写内核，`bench/tcu_flash_attn.cu` + 已接入包内
       `codegen.py`）：**16 warp × 16 行 = 256 行/block、3 block/SM**、每轮
       64 key + 惰性基准；`load_kv` 按 4 字节搬 K/V；dropout 掩码改用 32 位
-      murmur3。实测 plain **0.5998 ms / 57.3 TFLOPS**（regs=79 local=0，
-      物化基线的 2.33×）；mask 0.9009、dropout **0.8791**、mask+dropout
-      **1.4339**。真机四模式 max_err 4.3e-5~4.6e-5、NaN=0，全量 conformance
-      104/7/0、68/68 ops（见"load_kv 4 字节化"与"dropout RNG 32 位化"）
+      murmur3；mask/dropout 预检按 `HAS_MASK` 分叉（有 mask 时并入写 P 的
+      一遍）。实测 plain **0.5996 ms / 57.3 TFLOPS**（regs=79 local=0，
+      物化基线的 2.33×）；mask **0.8481**、dropout **0.8812**、mask+dropout
+      **1.2721**。真机四模式 max_err 4.2e-5~4.7e-5、NaN=0，全量 conformance
+      104/7/0、68/68 ops（见"load_kv 4 字节化"与"mask/dropout 结构重排"）
 
 ## 训练层接入（框架侧唯一改动）
 
@@ -949,10 +950,53 @@ max_err **4.27e-5 / 4.27e-5 / 4.62e-5 / 4.62e-5**，bad=0、NaN/Inf=0；
 全量 conformance **104 executed / 7 refused / 0 failed，68/68 ops，PASS**。
 
 换 hash 后的新拆解（dropout 0.8791）：RNG 只剩 0.084、分母归约 0.136、
-预检 0.079。**mask+dropout 现在的最大单项是预检 pass（0.48 ms，占 1.4339
-的 33%），因为它要为每个元素读一次 mask。** 下一步若要继续压 md，
-要么把 mask 切片缓进 smem，要么改标准 online softmax（每轮 rescale，
-去掉预检）——后者会改变数值路径，需单独验证精度。
+预检 0.079。mask+dropout 的最大单项是预检 pass（0.48 ms，占 1.4339
+的 33%），因为它要为每个元素读一次 mask —— 见下一节。
+
+### mask/dropout 结构重排（2026-11-22 第六轮，当前定案）
+
+动机：mask+dropout 的预检 pass 每元素读一次 mask，占 1.4339 的 33%。
+上一轮已把 mask 总量从 3 遍（预检 + 写 P + 慢路径）压到 2 遍，本轮把
+预检与写 P 合成一遍，**mask 每轮每元素只读一次**。
+
+结构按 `HAS_MASK` 分叉（不再按 `HAS_DROP`）：
+
+- `!HAS_MASK`（plain / dropout）：预检仍是独立一遍——不读 mask，只用
+  `SF[0..1]/TF[0..1]` 与 `sc2` 重算 4 行分数、检测 `lim = mlr + 8`；
+  越界则 shfl 归约新基准、缩放 OF 与（dropout 的）ssr。dropout **必须**
+  走这条：分母 ssr 是 float 逐轮累加，若先按 -1e30 写 P，exp2 溢出成
+  inf，慢路径再乘 corr=0 就是 NaN。
+- `HAS_MASK`（mask / mask+dropout）：检测并入写 P 的一遍（`risky`），
+  越界时慢路径按新基准修正 OF / ssr 并重写这一批 P。快路径的 p 只写进
+  pw，在 `load_matrix_sync` 前就被覆盖，不会被消费。
+- `firstq = (kt == 0)`、`first = HAS_MASK && !HAS_DROP && firstq`：首轮
+  基准是 -1e30。纯 mask 首轮跳过快路径（慢路径必然全量重算，纯赚）；
+  mask+dropout 首轮**不跳过**——快路径的 hash 在慢路径也要重做，实测
+  "先算覆盖" 的寄存器分配更好、反而更快。
+- 慢路径用 `fix = mx > mn || first` 谓词控制写回（`fix || firstq` 时才写
+  pw），但**所有 lane 都必须执行循环体**：不同行组越界情况不同，
+  按行 `continue` 会让 lane 缺席后面的 shfl 归约。
+- 分母：批 A `ssr = firstq ? sv : ssr * corr`；批 B 只能 `ssr *= corr`。
+  批 B 首轮若再 `+sv` 会把本批算两遍（实测 md max_err 2.9），这是本轮
+  修掉的核心 bug。
+
+bench 四模式（512×512×64，bh=256，reps=20，同编译单元）：
+
+| 模式 | 上一版 | **本轮** | 变化 | regs/local |
+| --- | --- | --- | --- | --- |
+| plain | 0.5998 | **0.5996** | 持平 | 79/0 |
+| mask | 0.9009 | **0.8481** | -5.9% | 84/20 |
+| dropout | 0.8791 | **0.8812** | 持平（噪声） | 83/0 |
+| mask+dropout | 1.4339 | **1.2721** | **-11.3%** | 84/68 |
+
+真机回归（`install_hardware(..., replace=True)`，B=2,H=8，512×512×64，
+q/k/v 幅度 0.5，f16 直接喂图）：四模式 max_err
+**4.16e-5 / 4.69e-5 / 4.55e-5 / 4.67e-5**，NaN/Inf=0；全量 conformance
+**104 executed / 7 refused / 0 failed，68/68 ops，PASS**。
+
+回填细节：`codegen.py` 的 `af_attn_w16<HAS_MASK, HAS_DROP>` 已按上面
+分叉重写（DBG 测量参数不进包）；`backend.py` launcher 不变（1024 线程、
+grid `-(-s_len // 256)`、smem 33792 B 早已对齐）。
 
 ### 明天接着做
 
@@ -984,6 +1028,9 @@ max_err **4.27e-5 / 4.27e-5 / 4.62e-5 / 4.62e-5**，bad=0、NaN/Inf=0；
       maxabs ≤ 6.2e-4、NaN=0 → conformance **104/7/0，68/68 ops**。
 - [x] `bench/tcu_flash_attn.cu` 纳入 git（此前未跟踪，本轮复现历史数字时
       发现没有版本可回溯，直接导致 0.6725 的结论无法复核）。
+- [x] mask/dropout 预检按 `HAS_MASK` 分叉 → 回填 `codegen.py`（w16 结构，
+      无 DBG）→ 重打包 → 真机四模式 max_err ≤ 4.7e-5、NaN=0 →
+      conformance **104/7/0，68/68 ops**（bench：m -5.9%、md -11.3%）。
 
 ### 本轮随手记的坑
 
