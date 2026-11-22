@@ -698,6 +698,408 @@ extern "C" __global__ void af_attention_rescale(
 """
 
 
+# TCU flash attention（f16，D=E=64）。
+#
+# 与 ``attention_scores_source`` 的 GEMM 物化路径并列：Q/K/V 只在开始时读一次
+# HBM，分数矩阵永不落显存。结构来自 bench/tcu_flash_attn.cu 的 attn64：
+# 每 block 16 warp × 32 行 = 512 行、每轮 64 key（两批 32），softmax 用
+# **惰性基准**（只有分数超出基准 8（log2 空间）时才 4 步 shuffle 重算），
+# 分母非 dropout 时走 P@ones 的 mma、dropout 时走 warp 内 shuffle 求和。
+#
+# 四个模式编译成四个非模板启动器（``extern "C"``，便于 cuModuleGetFunction
+# 按固定名字取），模板实例化后内联，寄存器分配与 bench 完全一致。
+# 行方向允许 S 不是 512 的倍数：越界的 warp 照常参与块级同步，但只读第 0 行
+# 且不写输出（S 必须是 32 的倍数才能整 warp 判定）。
+_ILUVATAR_FLASH_SRC = "%PRELUDE%" + _ILUVATAR_ATTN_HELPERS + r"""
+#include <crt/iluvatar_mma.h>
+
+using namespace ixix::wmma;
+
+#define AF_NWT 16
+#define AF_NTH (AF_NWT * 64)
+#define AF_LOG2E 1.4426950408889634f
+
+// load_matrix_sync 忽略 ldm，按 TCU 私有 swizzle 取址；这是两套布局的实测公式。
+__device__ __forceinline__ int af_off_row(int row, int col) {
+  int i = col >> 4, c = col & 15, r = row >> 1;
+  return (i * 256 + r / 4 * 128) + ((r * 32 + c * 2 + (row & 1) + i * 64) & 127);
+}
+__device__ __forceinline__ int af_off_col(int row, int col) {
+  int r = row >> 1;
+  return (col >> 2) * 128 + (r & 3) * 32 + ((r >> 3) ^ (col >> 3)) * 16 +
+         ((r >> 2 & 1) ^ (col >> 2 & 1)) * 8 + (col & 3) * 2 + (row & 1);
+}
+
+// 32 个 key 的 K/V 重排进 swizzle 布局的 smem（每次 2048 个 half）。
+__device__ __forceinline__ void af_load_kv(__half* ks, __half* vs,
+                                           const __half* Kb0, const __half* Vb0,
+                                           int kt) {
+  const long long o = (long long)kt * 2048;
+  for (int idx = threadIdx.x; idx < 2048; idx += AF_NTH) {
+    int t = idx >> 6, d = idx & 63;
+    ks[((t >> 4) * 2 + (d >> 5)) * 512 + af_off_col(d & 31, t & 15)] = Kb0[o + idx];
+    vs[(d >> 4) * 512 + af_off_col(t, d & 15)] = Vb0[o + idx];
+  }
+}
+
+// dropout 的 0/1 判定：与 attention_rand 同一 seed 约定，逐位一致。
+__device__ __forceinline__ float af_flash_drop(float p, float p_drop,
+                                               float drop_scale,
+                                               unsigned long long seed,
+                                               long long idx) {
+  const unsigned long long z = attention_rand(seed, idx);
+  const float u = (float)((z >> 40) & 0xFFFFFFULL) * (1.0f / 16777216.0f);
+  return (u >= p_drop) ? p * drop_scale : 0.f;
+}
+
+template <bool HAS_MASK, bool HAS_DROP>
+__device__ __forceinline__ void af_attn64_body(
+    const __half* __restrict__ Q, const __half* __restrict__ K,
+    const __half* __restrict__ V, __half* __restrict__ O,
+    int S, int T, float scale, const __half* __restrict__ M, float p_drop,
+    float drop_scale, unsigned long long seed, int mask_shared) {
+  extern __shared__ __half sm[];
+  __half* ksm = sm;                    // 两批 K，各 2048（一次装载，免中间同步）
+  __half* vsm = ksm + 4096;            // 两批 V，各 4 x 16x16
+  __half* psm = vsm + 4096;            // 每 warp 一个 16x32 的 P（两批复用）
+  __half* ones_sm = psm + AF_NWT * 1024;
+  __shared__ float mls[AF_NWT * 32];   // 惰性基准（每 warp 32 行）
+  __shared__ float ssums[AF_NWT * 32]; // dropout 分母（每 warp 32 行）
+
+  const int warp = threadIdx.x >> 6;
+  const int lane = threadIdx.x & 63;
+  const int r0 = lane >> 4;
+  const int c0 = lane & 15;
+  const int bh = blockIdx.y;
+  const int row_base = blockIdx.x * (32 * AF_NWT) + warp * 32;
+  // 行数不是 512 的倍数时，尾部 warp 只读第 0 行、不写输出；块级同步照常。
+  const int rb = (row_base < S) ? row_base : 0;
+
+  const __half* Qb = Q + (long long)bh * S * 64;
+  __half* Ob = O + (long long)bh * S * 64;
+  const __half* Kb0 = K + (long long)bh * T * 64;
+  const __half* Vb0 = V + (long long)bh * T * 64;
+  __half* pw = psm + warp * 1024;
+
+  fragment<matrix_a, 16, 16, 32, __half, row_major> a00, a01, a10, a11, pa0, pa1;
+  fragment<matrix_b, 16, 16, 32, __half, col_major> b0, b1, b2, b3, vbo;
+  fragment<accumulator, 16, 16, 32, float> s00, s01, s10, s11;  // 批 A 分数
+  fragment<accumulator, 16, 16, 32, float> t00, t01, t10, t11;  // 批 B 分数
+  fragment<accumulator, 16, 16, 32, float> o0, o1, o2, o3, o4, o5, o6, o7, o8, o9;
+
+  // Q 装载：A fragment 要"同列相邻两行"，gmem 是行内相邻列，借 P 的 smem 中转。
+  {
+    __half* qtmp = pw;
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      for (int idx = lane; idx < 1024; idx += 64) {
+        int m = idx >> 6, d = idx & 63;
+        qtmp[(d >> 5) * 512 + af_off_row(m, d & 31)] =
+            Qb[(long long)(rb + half * 16 + m) * 64 + d];
+      }
+      __syncwarp();
+      if (half == 0) {
+        load_matrix_sync(a00, qtmp, 32);
+        load_matrix_sync(a01, qtmp + 512, 32);
+      } else {
+        load_matrix_sync(a10, qtmp, 32);
+        load_matrix_sync(a11, qtmp + 512, 32);
+      }
+      __syncwarp();
+    }
+  }
+
+  fragment<accumulator, 16, 16, 32, float>* SF[2][2] = {{&s00, &s01}, {&s10, &s11}};
+  fragment<accumulator, 16, 16, 32, float>* SB[2][2] = {{&t00, &t01}, {&t10, &t11}};
+  fragment<accumulator, 16, 16, 32, float>* OF[2][5] = {
+      {&o0, &o1, &o2, &o3, &o8}, {&o4, &o5, &o6, &o7, &o9}};
+
+#pragma unroll
+  for (int g = 0; g < 2; ++g)
+#pragma unroll
+    for (int e = 0; e < 5; ++e) fill_fragment(*OF[g][e], 0.f);
+
+  // 基准放 smem：8 个 float 常驻会顶破 128 寄存器门槛，掉到 1 block/SM。
+  for (int idx = threadIdx.x; idx < AF_NWT * 32; idx += AF_NTH) {
+    mls[idx] = -1e30f;
+    ssums[idx] = 0.f;
+  }
+  for (int idx = threadIdx.x; idx < 512; idx += AF_NTH) {
+    int t = idx >> 4, dd = idx & 15;
+    ones_sm[af_off_col(t, dd)] = __float2half(1.f);
+  }
+  __syncthreads();
+  load_matrix_sync(vbo, ones_sm, 32);
+
+  // exp 走 log2 空间：分数直接乘 scale*log2e。
+  const float sc2 = scale * AF_LOG2E;
+  float* mlr = mls + warp * 32;
+  float* ssr = ssums + warp * 32;
+
+  // mask/dropout 的行基址只随 (g,q) 偏移：循环外算一次，消掉每轮 8 次
+  // (row % S) 的整数除法（mask 路径的主要开销）。
+  const __half* mbase = nullptr;
+  long long dbase = 0;
+  if (HAS_MASK) {
+    const int mr0 = (mask_shared ? (rb % S) : (bh * S + rb)) + r0;
+    mbase = M + (long long)mr0 * T;
+  }
+  if (HAS_DROP) dbase = (long long)(bh * S + rb + r0) * T;
+
+  for (int kt = 0; kt < T; kt += 64) {
+    const bool hasB = (kt + 32 < T);
+    af_load_kv(ksm, vsm, Kb0, Vb0, kt >> 5);
+    if (hasB) af_load_kv(ksm + 2048, vsm + 2048, Kb0, Vb0, (kt >> 5) + 1);
+    __syncthreads();
+
+    // 批 A 的 QK
+    fill_fragment(s00, 0.f);
+    fill_fragment(s01, 0.f);
+    fill_fragment(s10, 0.f);
+    fill_fragment(s11, 0.f);
+    load_matrix_sync(b0, ksm, 32);
+    load_matrix_sync(b1, ksm + 512, 32);
+    load_matrix_sync(b2, ksm + 1024, 32);
+    load_matrix_sync(b3, ksm + 1536, 32);
+    mma_sync(s00, a00, b0, s00);
+    mma_sync(s00, a01, b1, s00);
+    mma_sync(s01, a00, b2, s01);
+    mma_sync(s01, a01, b3, s01);
+    mma_sync(s10, a10, b0, s10);
+    mma_sync(s10, a11, b1, s10);
+    mma_sync(s11, a10, b2, s11);
+    mma_sync(s11, a11, b3, s11);
+
+    // 批 B 的 QK（T 不是 64 的倍数时填 -1e30，使 exp 为 0）
+    if (hasB) {
+      fill_fragment(t00, 0.f);
+      fill_fragment(t01, 0.f);
+      fill_fragment(t10, 0.f);
+      fill_fragment(t11, 0.f);
+      load_matrix_sync(b0, ksm + 2048, 32);
+      load_matrix_sync(b1, ksm + 2048 + 512, 32);
+      load_matrix_sync(b2, ksm + 2048 + 1024, 32);
+      load_matrix_sync(b3, ksm + 2048 + 1536, 32);
+      mma_sync(t00, a00, b0, t00);
+      mma_sync(t00, a01, b1, t00);
+      mma_sync(t01, a00, b2, t01);
+      mma_sync(t01, a01, b3, t01);
+      mma_sync(t10, a10, b0, t10);
+      mma_sync(t10, a11, b1, t10);
+      mma_sync(t11, a10, b2, t11);
+      mma_sync(t11, a11, b3, t11);
+    } else {
+      fill_fragment(t00, -1e30f);
+      fill_fragment(t01, -1e30f);
+      fill_fragment(t10, -1e30f);
+      fill_fragment(t11, -1e30f);
+    }
+
+    // 惰性归约：只有某分数超出基准 8（log2 空间）时才重算基准。
+    bool risky = false;
+#pragma unroll
+    for (int g = 0; g < 2; ++g)
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        float x0 = SF[g][0]->x[q] * sc2, x1 = SF[g][1]->x[q] * sc2;
+        float x2 = SB[g][0]->x[q] * sc2, x3 = SB[g][1]->x[q] * sc2;
+        if (HAS_MASK) {
+          const __half* mr = mbase + ((g * 16 + 4 * q) * T + kt);
+          x0 += __half2float(mr[c0]) * AF_LOG2E;
+          x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
+          if (hasB) {
+            x2 += __half2float(mr[32 + c0]) * AF_LOG2E;
+            x3 += __half2float(mr[48 + c0]) * AF_LOG2E;
+          }
+        }
+        risky |= (fmaxf(fmaxf(x0, x1), fmaxf(x2, x3)) >
+                  mlr[g * 16 + r0 + 4 * q] + 8.f);
+      }
+    if (__any_sync(0xffffffffu, risky)) {
+#pragma unroll
+      for (int g = 0; g < 2; ++g)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          float x0 = SF[g][0]->x[q] * sc2, x1 = SF[g][1]->x[q] * sc2;
+          float x2 = SB[g][0]->x[q] * sc2, x3 = SB[g][1]->x[q] * sc2;
+          if (HAS_MASK) {
+            const __half* mr = mbase + ((g * 16 + 4 * q) * T + kt);
+            x0 += __half2float(mr[c0]) * AF_LOG2E;
+            x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
+            if (hasB) {
+              x2 += __half2float(mr[32 + c0]) * AF_LOG2E;
+              x3 += __half2float(mr[48 + c0]) * AF_LOG2E;
+            }
+          }
+          float mn = mlr[g * 16 + r0 + 4 * q], corr = 1.f;
+          float mx = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
+#pragma unroll
+          for (int off = 1; off < 16; off <<= 1)
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+          if (mx > mn) {
+            corr = exp2f(mn - mx);
+            mlr[g * 16 + r0 + 4 * q] = mx;
+            // dropout 分母是 float 逐轮累加，必须与分子同步缩放。
+            if (HAS_DROP && c0 == 0) ssr[g * 16 + r0 + 4 * q] *= corr;
+          }
+#pragma unroll
+          for (int e = 0; e < 5; ++e) OF[g][e]->x[q] *= corr;
+        }
+    }
+    __syncwarp();
+
+    // 快路径：基准直接用 ml，只写批 A 的 P（pw 只有一批的空间）。
+#pragma unroll
+    for (int g = 0; g < 2; ++g)
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        float mn = mlr[g * 16 + r0 + 4 * q];
+        float x0 = SF[g][0]->x[q] * sc2, x1 = SF[g][1]->x[q] * sc2;
+        if (HAS_MASK) {
+          const __half* mr = mbase + ((g * 16 + 4 * q) * T + kt);
+          x0 += __half2float(mr[c0]) * AF_LOG2E;
+          x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
+        }
+        float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
+        if (HAS_DROP) {
+          const long long base = dbase + (g * 16 + 4 * q) * T + kt;
+          float sv = p0 + p1;
+          p0 = af_flash_drop(p0, p_drop, drop_scale, seed, base + c0);
+          p1 = af_flash_drop(p1, p_drop, drop_scale, seed, base + 16 + c0);
+#pragma unroll
+          for (int off = 1; off < 16; off <<= 1)
+            sv += __shfl_xor_sync(0xffffffffu, sv, off);
+          if (c0 == 0) ssr[g * 16 + r0 + 4 * q] += sv;
+        }
+        int row = r0 + 4 * q;
+        pw[g * 512 + af_off_row(row, c0)] = __float2half(p0);
+        pw[g * 512 + af_off_row(row, 16 + c0)] = __float2half(p1);
+      }
+
+    // 批 A 的 PV（b0..b3 与 QK 的 K 复用：QK 已算完）
+    __syncwarp();
+    load_matrix_sync(pa0, pw, 32);
+    load_matrix_sync(pa1, pw + 512, 32);
+    load_matrix_sync(b0, vsm, 32);
+    load_matrix_sync(b1, vsm + 512, 32);
+    load_matrix_sync(b2, vsm + 1024, 32);
+    load_matrix_sync(b3, vsm + 1536, 32);
+    mma_sync(o0, pa0, b0, o0);
+    mma_sync(o1, pa0, b1, o1);
+    mma_sync(o2, pa0, b2, o2);
+    mma_sync(o3, pa0, b3, o3);
+    mma_sync(o4, pa1, b0, o4);
+    mma_sync(o5, pa1, b1, o5);
+    mma_sync(o6, pa1, b2, o6);
+    mma_sync(o7, pa1, b3, o7);
+    if (!HAS_DROP) {   // dropout 时分母走 shuffle 求和，省掉这 2 条 mma
+      mma_sync(o8, pa0, vbo, o8);
+      mma_sync(o9, pa1, vbo, o9);
+    }
+
+    if (hasB) {
+      // 批 B 的 P 在这里现算（不占暂存寄存器），pw 已空出。
+      __syncwarp();
+#pragma unroll
+      for (int g = 0; g < 2; ++g)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          float mn = mlr[g * 16 + r0 + 4 * q];
+          float x0 = SB[g][0]->x[q] * sc2, x1 = SB[g][1]->x[q] * sc2;
+          if (HAS_MASK) {
+            const __half* mr = mbase + ((g * 16 + 4 * q) * T + kt);
+            x0 += __half2float(mr[32 + c0]) * AF_LOG2E;
+            x1 += __half2float(mr[48 + c0]) * AF_LOG2E;
+          }
+          float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
+          if (HAS_DROP) {
+            const long long base = dbase + (g * 16 + 4 * q) * T + kt + 32;
+            float sv = p0 + p1;
+            p0 = af_flash_drop(p0, p_drop, drop_scale, seed, base + c0);
+            p1 = af_flash_drop(p1, p_drop, drop_scale, seed, base + 16 + c0);
+#pragma unroll
+            for (int off = 1; off < 16; off <<= 1)
+              sv += __shfl_xor_sync(0xffffffffu, sv, off);
+            if (c0 == 0) ssr[g * 16 + r0 + 4 * q] += sv;
+          }
+          int row = r0 + 4 * q;
+          pw[g * 512 + af_off_row(row, c0)] = __float2half(p0);
+          pw[g * 512 + af_off_row(row, 16 + c0)] = __float2half(p1);
+        }
+      __syncwarp();
+      load_matrix_sync(pa0, pw, 32);
+      load_matrix_sync(pa1, pw + 512, 32);
+      load_matrix_sync(b0, vsm + 2048, 32);
+      load_matrix_sync(b1, vsm + 2048 + 512, 32);
+      load_matrix_sync(b2, vsm + 2048 + 1024, 32);
+      load_matrix_sync(b3, vsm + 2048 + 1536, 32);
+      mma_sync(o0, pa0, b0, o0);
+      mma_sync(o1, pa0, b1, o1);
+      mma_sync(o2, pa0, b2, o2);
+      mma_sync(o3, pa0, b3, o3);
+      mma_sync(o4, pa1, b0, o4);
+      mma_sync(o5, pa1, b1, o5);
+      mma_sync(o6, pa1, b2, o6);
+      mma_sync(o7, pa1, b3, o7);
+      if (!HAS_DROP) {
+        mma_sync(o8, pa0, vbo, o8);
+        mma_sync(o9, pa1, vbo, o9);
+      }
+    }
+    __syncthreads();
+  }
+
+  // 归一化放在输出上：(p/l)@V == (p@V)/l；dropout 时 l 是 dropout 前的和。
+  if (row_base < S) {
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        float den = HAS_DROP ? ssr[g * 16 + r0 + 4 * q] : OF[g][4]->x[q];
+        float inv = den != 0.f ? 1.f / den : 0.f;
+        int row = rb + g * 16 + r0 + 4 * q;
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+          Ob[row * 64 + e * 16 + c0] = __float2half(OF[g][e]->x[q] * inv);
+      }
+    }
+  }
+}
+
+#define AF_FLASH_ARGS                                                        \
+  const __half* __restrict__ Q, const __half* __restrict__ K,                \
+      const __half* __restrict__ V, __half* __restrict__ O, int S, int T,    \
+      float scale, const __half* __restrict__ M, float p_drop,               \
+      float drop_scale, unsigned long long seed, int mask_shared
+
+extern "C" __global__ void __launch_bounds__(AF_NTH, 2) af_flash_attn_plain(
+    AF_FLASH_ARGS) {
+  af_attn64_body<false, false>(Q, K, V, O, S, T, scale, M, p_drop, drop_scale,
+                               seed, mask_shared);
+}
+extern "C" __global__ void __launch_bounds__(AF_NTH, 2) af_flash_attn_mask(
+    AF_FLASH_ARGS) {
+  af_attn64_body<true, false>(Q, K, V, O, S, T, scale, M, p_drop, drop_scale,
+                              seed, mask_shared);
+}
+extern "C" __global__ void __launch_bounds__(AF_NTH, 2) af_flash_attn_drop(
+    AF_FLASH_ARGS) {
+  af_attn64_body<false, true>(Q, K, V, O, S, T, scale, M, p_drop, drop_scale,
+                              seed, mask_shared);
+}
+extern "C" __global__ void __launch_bounds__(AF_NTH, 2) af_flash_attn_mask_drop(
+    AF_FLASH_ARGS) {
+  af_attn64_body<true, true>(Q, K, V, O, S, T, scale, M, p_drop, drop_scale,
+                             seed, mask_shared);
+}
+"""
+
+
+def flash_attention_source():
+    """f16 TCU flash attention 源码（D=E=64，mask/dropout 由启动器区分）。"""
+    return _ILUVATAR_FLASH_SRC
+
+
 def attention_scores_source(np_reg: int = 0):
     """GEMM 路径的 softmax+mask+dropout 内核源码。
 

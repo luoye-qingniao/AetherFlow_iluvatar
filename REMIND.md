@@ -705,6 +705,39 @@ half（上限 65504）不会溢出；滞后导致的极小项下溢后反正会�
   全部 `bad=0`；plain `T=32/64/96/128/256` 与 attn32 误差一致（约 0.0021）。
 - 剩余成本是 64 位 splitmix64（必须逐位一致，无法简化）与 4 处 mask half 读。
 
+#### 接入包内的分派 bug（2026-11-22 定位并修复）
+
+内核本身在 bench 里一直是对的，问题在 `backend.py` 把类型字符串算错了：
+
+```python
+# 错：下标与命名不匹配
+kind = ("plain", "mask", "drop", "mask_drop")[2 * has_mask + (1 if p_drop > 0)]
+# 对：下标 = mask 位 + 2 * dropout 位
+kind = ("plain", "mask", "drop", "mask_drop")[has_mask + 2 * (1 if p_drop > 0 else 0)]
+```
+
+旧写法下 mask 模式算得 2 落到 `drop`（`HAS_MASK=false, HAS_DROP=true`），dropout
+模式算得 1 落到 `mask`，**只有 plain(0) 与 mask_drop(3) 恰好命中**。所以包内
+mask 被整体忽略、dropout 也被整体忽略，而 numerics 看起来"还行"。
+
+为什么之前没发现：softmax 平移不变，常数 mask / 行线性 mask / 单行非零 mask
+这几种自测输入**本来就不改变输出**，全都"通过"。
+
+排查手法（天数**不支持设备端 printf**，插了没有任何输出）：
+
+1. **列探针**：S=T=64、bh=1、Q=K=0、`V[t][d]=t`、`mask[:,j]=-1e4`。此时
+   `got` 应随 j 变化（只剩第 j 个 key），实测所有 j 恒为 **31.5**（= 全 64 key
+   均值）→ 证明 mask 根本没进内核，而不是列错位。
+2. **输出探针**：把 `Ob[0] = __float2half(HAS_MASK ? 1000.f : 2000.f);` 写进内核
+   尾部，得到 `2000`，Python 侧同时打印出 `kind would be drop`，直接锁定分派表。
+   （无条件探针 `Ob[0]=12345` 先跑过一次，证明内核与插桩都在真正执行。）
+3. 修复后对拍 30 个 case 全过：S/T 组合 512×512 bh=2、512×96、96×512、
+   512×64 bh=2、64×512 bh=3，模式 p/ms/mh/d/msd/mhd，`bad=0`、`rel ≤ 0.0018`。
+4. 全量 conformance：**104 executed / 7 refused / 0 failed，PASS**。
+
+经验：**内核在独立 bench 正确 ≠ 包内正确**。分派表、模板实参、mask_shared
+这类"胶水层"必须用能改变输出的输入单独验证，不能靠形状/无异常判断。
+
 ### 明天接着做
 
 - [x] ~~**验证 Δ 平移**~~ **已放弃**：exp 前统一减 `mn + Δ` 属于
@@ -713,12 +746,16 @@ half（上限 65504）不会溢出；滞后导致的极小项下溢后反正会�
       降频（MR>1）路线整体关闭。
 - [x] 支持 mask（`[S,T]` 与 `[B,H,S,T]`）与 dropout（RNG 索引语义与现有
       实现一致）。
-- [ ] 明确回退条件：S/T 非 32 倍数、D≠64 或 E≠64、f32 → 回退物化路径。
-- [ ] 接入 `iluvatar_af`：`_op_attention` 增加 f16 + D=E=64 + `T%32==0`
-      快路径，其余走现有物化实现。
-- [ ] `py -3.10 build.py` 重打包 + 远端 `install_hardware(zip, replace=True)`；
-      真机对拍 7 项 + 全量 conformance（必须 104 executed / 7 refused /
-      0 failed）。
+- [x] 明确回退条件：`_op_attention` 前置判断 `s_len/d/t_len/e == 0`、
+      `bh > 65535`、`bh*S*T*itemsize > _ATTENTION_GEMM_MAX_BYTES` 直接走父类；
+      快路径自身只接 `f16 && d==64 && e==64 && S%32==0 && T%32==0`，
+      其余（f32、D/E≠64、非 32 倍数）落到物化实现。
+- [x] 接入 `iluvatar_af`：`_op_attention` 增加 f16 + D=E=64 + `T%32==0`
+      快路径，其余走现有物化实现（分派 bug 见上一小节）。
+- [x] 真机对拍 30 case（`bad=0`、`rel ≤ 0.0018`）+ 全量 conformance
+      **104 executed / 7 refused / 0 failed，PASS**。
+- [ ] `py -3.10 build.py` 重打包 + 远端 `install_hardware(zip, replace=True)`
+      （远端当前是手工覆盖的文件，功能等价，缺一次正式打包留痕）。
 
 ### 本轮随手记的坑
 
