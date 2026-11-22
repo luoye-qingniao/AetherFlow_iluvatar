@@ -754,8 +754,15 @@ mask 被整体忽略、dropout 也被整体忽略，而 numerics 看起来"还�
       快路径，其余走现有物化实现（分派 bug 见上一小节）。
 - [x] 真机对拍 30 case（`bad=0`、`rel ≤ 0.0018`）+ 全量 conformance
       **104 executed / 7 refused / 0 failed，PASS**。
-- [ ] `py -3.10 build.py` 重打包 + 远端 `install_hardware(zip, replace=True)`
-      （远端当前是手工覆盖的文件，功能等价，缺一次正式打包留痕）。
+- [x] `py -3.10 build.py` 重打包 + 远端 `install_hardware(zip, replace=True)`
+      正式留痕，回归结果：
+      - `plain rel=0.00033`、有限值；
+      - **mask 列探针 OK**（`mask[:,j]=-1e4` 屏蔽第 j 个 key，输出等于其余
+        63 个 key 的均值 `(2016-j)/63`；若 mask 失效会是常数 31.5，即全 64
+        个均值——这两种值很接近，写判据时别搞反）；
+      - `dropout` 与 plain 不逐位相同（maxdiff 1.27），证明 drop 实例真的在用；
+      - `mask+dropout` 有限且与 plain 有差异（maxdiff 4.02）；
+      - 全量 conformance **104 executed / 7 refused / 0 failed，PASS**。
 
 ### 本轮随手记的坑
 
