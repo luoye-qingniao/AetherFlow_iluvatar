@@ -924,7 +924,6 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
   __half* vsm = ksm + 4096;             // 两批 V，各 2048
   __half* psm = vsm + 4096;             // 每 warp 一个 16x32 的 P（Q 中转发复用）
   __half* ones_sm = psm + NWT16 * 512;  // 16x16 全 1，用于 P@ones
-  __shared__ float mls[NWT16 * 16];     // 惰性基准（每 warp 16 行）
   __shared__ float ssums[NWT16 * 16];   // dropout 模式下的分母（每 warp 16 行）
 
   const int warp = threadIdx.x >> 6;
@@ -968,11 +967,7 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
 #pragma unroll
   for (int e = 0; e < 5; ++e) fill_fragment(*OF[e], 0.f);
 
-  for (int idx = threadIdx.x; idx < NWT16 * 16; idx += NTH16) {
-    // DBG=2 删掉预检后不能再用 -1e30 当基准（exp2 会溢出成 inf 干扰计时）
-    mls[idx] = (DBG == 2) ? 0.f : -1e30f;
-    ssums[idx] = 0.f;
-  }
+  for (int idx = threadIdx.x; idx < NWT16 * 16; idx += NTH16) ssums[idx] = 0.f;
   for (int idx = threadIdx.x; idx < 512; idx += NTH16) {
     int t = idx >> 4, dd = idx & 15;
     ones_sm[off_col(t, dd)] = __float2half(1.f);
@@ -981,7 +976,12 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
   load_matrix_sync(vbo, ones_sm, 32);   // 分母矩阵不变，全程装一次
 
   const float sc2 = scale * AF_LOG2E;
-  float* mlr = mls + warp * 16;
+  // 惰性基准常驻寄存器：每 lane 4 个，对应它负责的 4 行 r0+4*q。
+  // 原来每轮每行都要从 smem 读一次基准、读后立即参与 exp2 的减法，
+  // 这条"读-用"依赖链是 softmax 段的主要停顿来源（实测省 0.055 ms / 8.8%）。
+  // DBG=2 删掉预检后不能用 -1e30 当基准（exp2 会溢出成 inf 干扰计时）。
+  const float ml0 = (DBG == 2) ? 0.f : -1e30f;
+  float mlr_reg[4] = {ml0, ml0, ml0, ml0};
   float* ssr = ssums + warp * 16;
 
   // mask/dropout 的行基址循环外算一次，避免每轮做 (gl % S) 的整数除法。
@@ -1038,7 +1038,7 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
         const int ri = r0 + 4 * q;
-        const float lim = mlr[ri] + 8.f * RISKMOD;
+        const float lim = mlr_reg[q] + 8.f * RISKMOD;
         float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
         float x2 = TF[0]->x[q] * sc2, x3 = TF[1]->x[q] * sc2;
         risk |= fmaxf(fmaxf(x0, x1), fmaxf(x2, x3)) > lim;
@@ -1047,7 +1047,7 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
           const int ri = r0 + 4 * q;
-          const float mn = mlr[ri];
+          const float mn = mlr_reg[q];
           float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
           float x2 = TF[0]->x[q] * sc2, x3 = TF[1]->x[q] * sc2;
           float mx = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
@@ -1057,7 +1057,7 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
           float corr = 1.f;
           if (mx > mn) {
             corr = exp2f(mn - mx);
-            mlr[ri] = mx;
+            mlr_reg[q] = mx;
           }
 #pragma unroll
           for (int e = 0; e < 5; ++e) OF[e]->x[q] *= corr;
@@ -1082,7 +1082,7 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
       const int ri = r0 + 4 * q;
-      const float mn = mlr[ri];
+      const float mn = mlr_reg[q];
       float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
       if (HAS_MASK) {
         const __half* mr = mbase + (4 * q * T + kt);
@@ -1130,7 +1130,7 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
             x0 += __half2float(mr[c0]) * AF_LOG2E;
             x1 += __half2float(mr[16 + c0]) * AF_LOG2E;
           }
-          float mn = mlr[ri], corr = 1.f;
+          float mn = mlr_reg[q], corr = 1.f;
           float mx = fmaxf(x0, x1);
 #pragma unroll
           for (int off = 1; off < 16; off <<= 1)
@@ -1138,7 +1138,7 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
           const bool fix = mx > mn || first;
           if (fix) {
             corr = exp2f(mn - mx);
-            mlr[ri] = mx;
+            mlr_reg[q] = mx;
             mn = mx;
           }
 #pragma unroll
@@ -1189,7 +1189,7 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
         const int ri = r0 + 4 * q;
-        const float mn = mlr[ri];
+        const float mn = mlr_reg[q];
         float x0 = TF[0]->x[q] * sc2, x1 = TF[1]->x[q] * sc2;
         if (HAS_MASK) {
           const __half* mr = mbase + (4 * q * T + kt);
@@ -1227,7 +1227,7 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
               x0 += __half2float(mr[32 + c0]) * AF_LOG2E;
               x1 += __half2float(mr[48 + c0]) * AF_LOG2E;
             }
-            float mn = mlr[ri], corr = 1.f;
+            float mn = mlr_reg[q], corr = 1.f;
             float mx = fmaxf(x0, x1);
 #pragma unroll
             for (int off = 1; off < 16; off <<= 1)
@@ -1235,7 +1235,7 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
             const bool fix = mx > mn || first;
             if (fix) {
               corr = exp2f(mn - mx);
-              mlr[ri] = mx;
+              mlr_reg[q] = mx;
               mn = mx;
             }
 #pragma unroll
@@ -1306,13 +1306,90 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
 //   ABL=24 完整版但 exp2 换硬件近似 __expf(x*ln2)，验证 exp2f 是否已走硬件
 //   ABL=30~32 完整版但风险检测降频：每 2 轮 / 每 4 轮 / 不做（阈值 8→16/32，
 //             ABL32 需把基准初值从 -1e30 改成 0 才不会让 P 溢成 inf）
+//   ABL=33 完整版但惰性基准常驻寄存器（每 lane 4 个），其余与 ABL21 相同
 // 注意 ABL=4 删掉大量代码后寄存器下降，实际 occupancy 可能高于 3 block/SM，
 // 所以它给的是**乐观上限**，只能当下界参照，不能当"可达值"。
+#ifdef AF_TRY_F16EX2
+#if __has_builtin(__nvvm_ex2_approx_f16)
+#define AF_HAS_EX2_F16 1
+#endif
+#endif
+
+// 2^x 的纯 FMA 实现（FA4 的做法）：Cody-Waite 拆整数/小数，3 阶 Horner。
+// 输入 x ∈ [-8, 0]（attention 的 x-mn），2^n 的位拼接不需求钳位。
+// 精度：[-0.5,0.5] 上相对误差 ~2e-5，远好于 half 的 5e-4。
+__device__ __forceinline__ float af_exp2_poly(float x) {
+  const float magic = 12582912.f;               // 1.5 * 2^23
+  const float t = x + magic;
+  const float f = x - (t - magic);              // f ∈ [-0.5, 0.5]
+  const int n = __float_as_int(t) - 0x4b400000; // t 的低位就是整数部分
+  float p = 0.05550411f;
+  p = fmaf(p, f, 0.24022651f);
+  p = fmaf(p, f, 0.69314718f);
+  p = fmaf(p, f, 1.0f);
+  return p * __int_as_float((n + 127) << 23);
+}
+
+// 写 P 到 smem 的 swizzle 地址。ABL=28 换成线性地址（数值作废），
+// 用来把 off_row 的整数运算成本从"转换 + store"里单独拆出来。
+__device__ __forceinline__ void off_store_p(__half* pw, int row, int c0, float p0,
+                                            float p1) {
+  pw[off_row(row, c0)] = __float2half(p0);
+  pw[off_row(row, 16 + c0)] = __float2half(p1);
+}
+
+template <int ABL>
+__device__ __forceinline__ void ab_put_p(__half* pw, int row, int c0, int lin,
+                                         float p0, float p1, bool vput) {
+  if (ABL == 28) {
+    const int o = lin & 511;
+    pw[o] = __float2half(p0);
+    pw[(o + 256) & 511] = __float2half(p1);
+  } else if (vput) {
+    *(volatile __half*)&pw[off_row(row, c0)] = __float2half(p0);
+    *(volatile __half*)&pw[off_row(row, 16 + c0)] = __float2half(p1);
+  } else {
+    off_store_p(pw, row, c0, p0, p1);
+  }
+}
+
 template <int ABL>
 __device__ __forceinline__ float ab_exp2(float x) {
   // 24 = 用硬件近似（__expf 走 ex2.approx），数据在 log2 空间，故补乘 ln2
   if (ABL == 24) return __expf(x * 0.6931471805599453f);
+  if (ABL == 26) return af_exp2_poly(x);
+  if (ABL == 25) {
+#ifdef AF_HAS_EX2_F16
+    return (float)__nvvm_ex2_approx_f16((_Float16)x);
+#else
+    return exp2f(x);
+#endif
+  }
   return ABL == 1 ? x * 0.5f : exp2f(x);
+}
+
+// 惰性基准的存取。ABL=33 时基准常驻寄存器（每 lane 4 个，正好对应它负责的
+// 4 行 r0+4*q），省掉每次 exp2 前那条 smem 读及其依赖链（ABL29 实测约 0.033 ms）。
+template <int ABL>
+__device__ __forceinline__ float ab_mlr_get(const float* mlr, const float* reg,
+                                            int q, int ri) {
+  if (ABL == 33) return reg[q];
+  if (ABL == 29) return 0.f;
+  return *(volatile float*)&mlr[ri];
+}
+// 风险检测里读基准不经过 volatile：读后立刻参与比较，不会被提出循环，
+// 但 ABL29 的"跳过基准读"只针对主 exp2 段，这里仍需真实值。
+template <int ABL>
+__device__ __forceinline__ float ab_mlr_raw(const float* mlr, const float* reg,
+                                            int q, int ri) {
+  if (ABL == 33) return reg[q];
+  return mlr[ri];
+}
+template <int ABL>
+__device__ __forceinline__ void ab_mlr_set(float* mlr, float* reg, int q, int ri,
+                                           float v) {
+  if (ABL == 33) reg[q] = v;
+  else           mlr[ri] = v;
 }
 
 // 探针主体：写成 device 函数，便于用不同 launch_bounds 包两层壳。
@@ -1378,6 +1455,12 @@ __device__ __forceinline__ void attn64probe_body(
 
   const float sc2 = scale * AF_LOG2E;
   float* mlr = mls + warp * 16;
+  // ABL=33：惰性基准常驻寄存器（每 lane 4 个，对应它负责的 4 行）。
+  float mlr_reg[4];
+  if (ABL == 33) {
+#pragma unroll
+    for (int q = 0; q < 4; ++q) mlr_reg[q] = -1e30f;
+  }
 
   // 变体开关（正交，便于逐段加/减）：
   //   kv_on   搬 K/V + 12 次 fragment 装载 + syncthreads
@@ -1401,7 +1484,8 @@ __device__ __forceinline__ void attn64probe_body(
                     : (((ABL < 2) || (ABL >= 12 && ABL != 22 && ABL != 23)) ? 1 : 0);
   const bool sync_on = (ABL < 2) || (ABL >= 13) || (ABL == 22) || (ABL == 23);
   const bool pld_on = (ABL < 2) || (ABL == 3) || (ABL == 21) || (ABL == 22) ||
-                      (ABL == 23) || (ABL == 24);
+                      (ABL == 23) || (ABL == 24) || (ABL == 25) || (ABL == 26) ||
+                      (ABL == 27) || (ABL == 28) || (ABL == 29) || (ABL == 33);
   const bool vput = (ABL == 20);
 
   for (int kt = 0; kt < T; kt += 64) {
@@ -1450,7 +1534,7 @@ __device__ __forceinline__ void attn64probe_body(
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
           const int ri = r0 + 4 * q;
-          const float lim = mlr[ri] + 8.f * risk_mod;
+          const float lim = ab_mlr_raw<ABL>(mlr, mlr_reg, q, ri) + 8.f * risk_mod;
           float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
           float x2 = TF[0]->x[q] * sc2, x3 = TF[1]->x[q] * sc2;
           risk |= fmaxf(fmaxf(x0, x1), fmaxf(x2, x3)) > lim;
@@ -1459,7 +1543,7 @@ __device__ __forceinline__ void attn64probe_body(
 #pragma unroll
           for (int q = 0; q < 4; ++q) {
             const int ri = r0 + 4 * q;
-            const float mn = mlr[ri];
+            const float mn = ab_mlr_raw<ABL>(mlr, mlr_reg, q, ri);
             float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
             float x2 = TF[0]->x[q] * sc2, x3 = TF[1]->x[q] * sc2;
             float mx = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
@@ -1469,7 +1553,7 @@ __device__ __forceinline__ void attn64probe_body(
             float corr = 1.f;
             if (mx > mn) {
               corr = ab_exp2<ABL>(mn - mx);
-              mlr[ri] = mx;
+              ab_mlr_set<ABL>(mlr, mlr_reg, q, ri, mx);
             }
 #pragma unroll
             for (int e = 0; e < 5; ++e) OF[e]->x[q] *= corr;
@@ -1482,23 +1566,20 @@ __device__ __forceinline__ void attn64probe_body(
         const int ri = r0 + 4 * q;
         // volatile 读：ABL=10 不更新 mlr，普通读会被常量传播成 -1e30，
         // 连 f16 转换都可能被提出循环，测出来的就不是真实成本。
-        const float mn = *(volatile float*)&mlr[ri];
+        // ABL=29：跳过基准的 volatile 读（mn 用 0），量"读 mlr + 依赖链"成本
+        const float mn = ab_mlr_get<ABL>(mlr, mlr_reg, q, ri);
         float p0, p1;
         if (use_exp2) {
-          p0 = ab_exp2<ABL>(SF[0]->x[q] * sc2 - mn);
+          // ABL=27：p0 走 FMA 多项式（批 A），p1 留 SFU，两条流水交错发射
+          p0 = (ABL == 27) ? af_exp2_poly(SF[0]->x[q] * sc2 - mn)
+                           : ab_exp2<ABL>(SF[0]->x[q] * sc2 - mn);
           p1 = ab_exp2<ABL>(SF[1]->x[q] * sc2 - mn);
         } else {
           p0 = mn;
           p1 = mn;
         }
         const int row = r0 + 4 * q;
-        if (vput) {
-          *(volatile __half*)&pw[off_row(row, c0)] = __float2half(p0);
-          *(volatile __half*)&pw[off_row(row, 16 + c0)] = __float2half(p1);
-        } else {
-          pw[off_row(row, c0)] = __float2half(p0);
-          pw[off_row(row, 16 + c0)] = __float2half(p1);
-        }
+        ab_put_p<ABL>(pw, row, c0, lane * 8 + q, p0, p1, vput);
       }
       if (sync_on) __syncwarp();
     }
@@ -1526,23 +1607,19 @@ __device__ __forceinline__ void attn64probe_body(
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
         const int ri = r0 + 4 * q;
-        const float mn = *(volatile float*)&mlr[ri];
+        const float mn = ab_mlr_get<ABL>(mlr, mlr_reg, q, ri);
         float p0, p1;
         if (use_exp2) {
+          // ABL=27：与批 A 对称，p0 留 SFU，p1 走 FMA 多项式
           p0 = ab_exp2<ABL>(TF[0]->x[q] * sc2 - mn);
-          p1 = ab_exp2<ABL>(TF[1]->x[q] * sc2 - mn);
+          p1 = (ABL == 27) ? af_exp2_poly(TF[1]->x[q] * sc2 - mn)
+                           : ab_exp2<ABL>(TF[1]->x[q] * sc2 - mn);
         } else {
           p0 = mn;
           p1 = mn;
         }
         const int row = r0 + 4 * q;
-        if (vput) {
-          *(volatile __half*)&pw[off_row(row, c0)] = __float2half(p0);
-          *(volatile __half*)&pw[off_row(row, 16 + c0)] = __float2half(p1);
-        } else {
-          pw[off_row(row, c0)] = __float2half(p0);
-          pw[off_row(row, 16 + c0)] = __float2half(p1);
-        }
+        ab_put_p<ABL>(pw, row, c0, lane * 8 + q, p0, p1, vput);
       }
       if (sync_on) __syncwarp();
     }
@@ -1894,12 +1971,35 @@ int main(int argc, char** argv) {
                 16 * NWT16);
       run_probe("ABL24 exp近似 ", attn64probe<24>, SMEM16, abh, S, T, scale, NTH16,
                 16 * NWT16);
+      // exp2 的替代实现（FA4 路线）：纯 FMA 多项式 / SFU+FMA 混合分摊
+      run_probe("ABL26 FMA多项式", attn64probe<26>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL26b 重复   ", attn64probe<26>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL27 SFU+FMA ", attn64probe<27>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL27b 重复   ", attn64probe<27>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL25 f16ex2  ", attn64probe<25>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      // 写 P 的成本拆分：ABL28 线性地址（去 off_row 整数运算）/ ABL29 不读基准
+      run_probe("ABL28 线性地址", attn64probe<28>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL28b 重复   ", attn64probe<28>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL29 不读基准", attn64probe<29>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
       // 风险检测降频：每 2 轮 / 每 4 轮 / 不做（阈值同比放大到 8*N）
       run_probe("ABL30 检/2轮   ", attn64probe<30>, SMEM16, abh, S, T, scale, NTH16,
                 16 * NWT16);
       run_probe("ABL31 检/4轮   ", attn64probe<31>, SMEM16, abh, S, T, scale, NTH16,
                 16 * NWT16);
       run_probe("ABL32 不检测   ", attn64probe<32>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      // 惰性基准常驻寄存器：把 ABL29 省下的那条 smem 读真正拿掉（而非跳过）
+      run_probe("ABL33 基准进寄存器", attn64probe<33>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL33b 重复    ", attn64probe<33>, SMEM16, abh, S, T, scale, NTH16,
                 16 * NWT16);
       // 2 block/SM：流水版的寄存器预算下，能忍受多少占用损失
       run_probe("ABL0@2block  ", attn64probe2<0>, SMEM16, abh, S, T, scale, NTH16,

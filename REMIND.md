@@ -166,9 +166,10 @@ password: <口令随机器单独下发，不入库>
       `codegen.py`）：**16 warp × 16 行 = 256 行/block、3 block/SM**、每轮
       64 key + 惰性基准；`load_kv` 按 4 字节搬 K/V；dropout 掩码改用 32 位
       murmur3；mask/dropout 预检按 `HAS_MASK` 分叉（有 mask 时并入写 P 的
-      一遍）。实测 plain **0.5996 ms / 57.3 TFLOPS**（regs=79 local=0，
-      物化基线的 2.33×）；mask **0.8481**、dropout **0.8812**、mask+dropout
-      **1.2721**。真机四模式 max_err 4.2e-5~4.7e-5、NaN=0，全量 conformance
+      一遍）。实测 plain **0.5810 ms / 59.1 TFLOPS**（regs=77 local=0，
+      物化基线的 2.40×）；mask **0.7930**、dropout **0.8614**、mask+dropout
+      **1.2480**（第十轮把惰性基准搬进寄存器，见"惰性基准常驻寄存器"）。
+      真机四模式 max_err 4.2e-5~4.7e-5、NaN=0，全量 conformance
       104/7/0、68/68 ops（见"load_kv 4 字节化"与"mask/dropout 结构重排"）
 - [x] 官方 `ixattention-backend` 对照（第七轮）：D=E=64 自研更快，不接；
       **D=128 是唯一明确的性能缺口（实测物化 1.4944 ms / 23.0 TF，官方
@@ -1252,9 +1253,75 @@ sd=16 直接崩。根因不是饱和没做好，而是路线本身有洞：惰�
 **比例信息彻底丢失**，归一化后就是垃圾。sd=1 碰不到边界，所以探针好看。
 
 因此降频只能用于窄分布，不能作为公开包默认；**这条路关闭**。
-要继续往上走只剩"少算 exp2/写 P"，已分别验证过（硬件近似更慢、
-合并成一遍更慢）。37%（57.4/154.9）在当前 3 block/SM + 4 个 S fragment
-的约束下就是结构上限。
+
+### 惰性基准常驻寄存器（2026-11-27，第十轮，已落地）
+
+第九轮把 0.6208 ms 拆成六段后，唯一还没动的是**风险检测 0.0794 ms**。
+其中一半是每轮每行都要从 smem 读一次基准、读完立刻参与 exp2 的减法，
+这条"读-用"依赖链在 SFU 发射前插入一次 20+ cycle 的 smem 延迟。
+
+改法：把 `mlr`（每 warp 16 float）搬进寄存器，每 lane 只存它负责的 4 行
+（`r0 + 4*q`），正好 4 个 float。先做探针 ABL33（bh=256、S=T=512、reps=20）：
+
+| 变体 | ms | regs | 相对基线 |
+| --- | --- | --- | --- |
+| ABL21 完整（mlr 在 smem） | 0.6198 | 83 | — |
+| ABL29 跳过基准读（只测上限） | 0.5879 | — | −5.1% |
+| **ABL33 基准进寄存器** | **0.5653** | **80** | **−8.8%** |
+
+ABL33 比 ABL29 还快，且寄存器反而少 3 个：smem 版每次访问都要现算
+`mls + warp*16 + ri` 的地址，寄存器版把这部分也一起省了。
+
+回填正式内核 `attn64w16` 后（真机，bh=256、S=T=512）：
+
+| 模式 | 改前 | 改后 | 变化 | regs/local |
+| --- | --- | --- | --- | --- |
+| plain | 0.5996 / 57.3 TF | **0.5810 / 59.1 TF** | −3.1% | 77/0 |
+| mask | 0.8481 | 0.7930 | −6.5% | 84/12 |
+| dropout | 0.8812 | 0.8614 | −2.2% | — |
+| mask+dropout | 1.2721 | 1.2480 | −1.9% | — |
+
+plain 的收益（3.1%）小于探针的 8.8%，因为正式内核原本的 smem 读有一部分
+已被编译器与 exp2 的 SFU 延迟重叠掉；mask 模式收益更大是因为它的慢路径
+（`if (fix)`）里基准读的位置更靠因果链上游。
+
+对拍：plain/mask/dropout/mask+dropout 四模式 `bad=0`，max abs err 与
+attn64 参考一致（0.00212 / 0.00214 / 0.00378 / 0.00447，纯 half 精度量级）。
+包内 `codegen.py` 同步回填后在真机跑 f16 attention（plain 与 mask，
+shape `(1,8,512,64)`）全部 `executed`，max_error 9.77e-4（= half 1 ulp）；
+全量 conformance 的 attention_basic / attention_masked 也仍 PASS。
+smem 里那 1 KB 的 `mls` 一并删掉（静态 smem 2 KB → 1 KB，3 block/SM 不变）。
+
+### 第十轮同时排除的四个方向（网络调研 + SDK 头文件取证）
+
+**1. P 免 smem 往返（走 FA3 的寄存器内重排）——否决。**
+`iluvatar_mma.hpp` 的 `__imma_ld_row_b32`（acc 布局）每 lane 持有
+`(r,c),(r+4,c),(r+8,c),(r+12,c)`，`__hmma_ld_row_b16`（A 布局）每 lane 持有
+`(r2,c),(r2,c+1),(r2+8,c),(r2,c+16)...`，两者行分布完全不同，
+必须跨 16-lane 组转置。转置本身要 8 次 shuffle/bpermute，成本估 ≈ 0.087 ms，
+比现在写 smem 的 0.102 ms 只省一点，却要多花寄存器（当前 77/85 无余量）。
+
+**2. K/V 异步双缓冲 ——否决。** grep 全部 Iluvatar intrinsic，**没有任何**
+`cp.async` / TMA / DMA / prefetch / commit-wait 类指令；`mma_sync` 也是同步
+intrinsic（`__ivcorex_matrix_mad_f32x4_f16x4`，无分组）。加上 3 block/SM 下
+smem 33.8 KB×2 放不下，所以 GEMM 与 softmax 无法在单 block 内重叠。
+
+**3. 写 P 向量化（4B/8B store）——否决。** 67.1M 个 half 按 2 字节写，
+实测 0.102 ms ≈ 1.05M 条 warp-store 指令 × 64 lane，正好是"每 SM 1 条/2 cycle"
+的发射上限，不是带宽上限。但没法合并：acc 布局是"同列不同行"，
+A 需要"同行相邻列"——写齐则读散、读齐则写散，这是同一个转置矛盾。
+
+**4. FA3/FA4 的核心技巧 ——不适用。** FA3 的 warp specialization 与 2-stage
+流水依赖 WGMMA 的异步性；FA4 的 TMEM / 2-CTA / tcgen05 是 Blackwell 专属。
+FA4 的 FMA 多项式 exp2 与 conditional rescaling 已经分别验过（慢 6.4%、
+惰性基准下本来就只有极少数轮触发）。本机 MUFU 实测 22.7 个 exp2/SM/cycle，
+已接近 SFU 上限，exp2 那 0.124 ms 没有替代路径。
+
+结论：0.5810 ms / 59.1 TF / **38.2%**（59.1/154.9）是当前结构下的实际值。
+六段里 mma 0.223（硬件峰值）、exp2 0.124（SFU 上限）、写 P 0.102（store
+发射上限）、KV 0.077（415 GB/s 已超标称 384）、P 读回 0.010 都贴近硬下限；
+风险检测去掉基准读后剩 0.046。结构性再往上走需要 softmax 与 mma 重叠，
+而异步 GEMM 在这块硬件上不存在，故停止投入。
 
 ### 明天接着做
 
