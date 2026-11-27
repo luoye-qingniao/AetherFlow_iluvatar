@@ -910,7 +910,10 @@ __global__ void __launch_bounds__(NTH, 2) attn64p(
 #define NTH16 (NWT16 * 64)
 
 // DBG 只是测量探针：1=无 RNG，2=无预检 pass，3=无分母归约。0 为正式内核。
-template <bool HAS_MASK, bool HAS_DROP, int DBG = 0>
+// RISKMOD：每多少轮做一次惰性基准的风险检测（1=每轮，正式值）。
+//   降频靠"阈值放大到 8*RISKMOD"来保持同一触发语义，代价是滞后上界变成
+//   2^(8*RISKMOD)，超过 half 上限 65504 时必须把 P 饱和，否则出 inf/NaN。
+template <bool HAS_MASK, bool HAS_DROP, int DBG = 0, int RISKMOD = 1>
 __global__ void __launch_bounds__(NTH16, 3) attn64w16(
     const __half* __restrict__ Q, const __half* __restrict__ K,
     const __half* __restrict__ V, __half* __restrict__ O, int S, int T,
@@ -1029,12 +1032,13 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
     // 开销比"合并进写 P 的一遍"更低（实测 plain -5%、dropout -29%）。
     // dropout 也走这条：必须在写 P / 累加分母之前把基准定下来，
     // 否则首轮基准 -1e30 会让 exp2 溢出成 inf，corr 乘出 NaN。
-    if (!HAS_MASK && DBG != 2) {
+    if (!HAS_MASK && DBG != 2 &&
+        (RISKMOD == 1 || ((kt >> 6) % RISKMOD) == 0)) {
       bool risk = false;
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
         const int ri = r0 + 4 * q;
-        const float lim = mlr[ri] + 8.f;
+        const float lim = mlr[ri] + 8.f * RISKMOD;
         float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
         float x2 = TF[0]->x[q] * sc2, x3 = TF[1]->x[q] * sc2;
         risk |= fmaxf(fmaxf(x0, x1), fmaxf(x2, x3)) > lim;
@@ -1090,6 +1094,9 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
       // 其余轮次越界幅度有限（log2 空间十几个数量级），不会溢出。
       // 这样快路径的旧贡献缩放后与新基准的贡献严格相等，慢路径只需缩放。
       float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
+      // 降频后基准最多滞后 8*RISKMOD，P 可能越过 half 上限 65504。饱和后
+      // 归一化仍然正确（能饱和的行本就是极端占优项），避免 inf/NaN。
+      if (RISKMOD > 1) { p0 = fminf(p0, 65504.f); p1 = fminf(p1, 65504.f); }
       if (HAS_DROP) {
         const long long base = dbase + 4 * q * T + kt;
         float sv = p0 + p1;
@@ -1191,6 +1198,7 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
         }
         if (HAS_MASK && DBG != 2) risky |= fmaxf(x0, x1) > mn + 8.f;
         float p0 = exp2f(x0 - mn), p1 = exp2f(x1 - mn);
+        if (RISKMOD > 1) { p0 = fminf(p0, 65504.f); p1 = fminf(p1, 65504.f); }
         if (HAS_DROP) {
           const long long base = dbase + 4 * q * T + kt + 32;
           float sv = p0 + p1;
@@ -1296,6 +1304,8 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
 //   ABL=10~13 在 ABL2 上逐级加：写 P → exp2 → 风险检测 → __syncwarp
 //   ABL=20~23 在完整版上正交地关/开单项，用来量 P 读回与写 P 的依赖链
 //   ABL=24 完整版但 exp2 换硬件近似 __expf(x*ln2)，验证 exp2f 是否已走硬件
+//   ABL=30~32 完整版但风险检测降频：每 2 轮 / 每 4 轮 / 不做（阈值 8→16/32，
+//             ABL32 需把基准初值从 -1e30 改成 0 才不会让 P 溢成 inf）
 // 注意 ABL=4 删掉大量代码后寄存器下降，实际 occupancy 可能高于 3 block/SM，
 // 所以它给的是**乐观上限**，只能当下界参照，不能当"可达值"。
 template <int ABL>
@@ -1357,7 +1367,8 @@ __device__ __forceinline__ void attn64probe_body(
 
 #pragma unroll
   for (int e = 0; e < 5; ++e) fill_fragment(*OF[e], 0.f);
-  for (int idx = threadIdx.x; idx < NWT16 * 16; idx += NTH16) mls[idx] = -1e30f;
+  for (int idx = threadIdx.x; idx < NWT16 * 16; idx += NTH16)
+    mls[idx] = (ABL == 32) ? 0.f : -1e30f;   // ABL32 不检测，-1e30 会让 P 变 inf
   for (int idx = threadIdx.x; idx < 512; idx += NTH16) {
     int t = idx >> 4, dd = idx & 15;
     ones_sm[off_col(t, dd)] = __float2half(1.f);
@@ -1380,10 +1391,14 @@ __device__ __forceinline__ void attn64probe_body(
   //   21 完整（自洽校验，应 ≈ 0）
   //   22 无 exp2、无风险检，其余完整（与 21 夹出 exp2 的关键路径成本）
   //   23 不写 P、读回陈旧值（量"写 P + 依赖链"）
+  //   30/31/32 完整但风险检测每 2 轮 / 每 4 轮 / 不做（降频收益上限）
   const bool kv_on = (ABL != 4);
   const bool sm_on = (ABL < 2) || (ABL >= 10 && ABL != 23);
   const bool use_exp2 = (ABL != 1) && (ABL != 10) && (ABL != 22);
-  const bool risk_on = (ABL < 2) || (ABL >= 12 && ABL != 22 && ABL != 23);
+  // risk_mod：每多少轮做一次风险检测；0 表示不做。阈值同比放大 8*risk_mod，
+  // 保证"检测间隔内基准滞后不超过该值"，P 的 half 上界不超 2^(8*risk_mod)。
+  const int risk_mod = (ABL == 30) ? 2 : (ABL == 31) ? 4 : (ABL == 32) ? 0
+                    : (((ABL < 2) || (ABL >= 12 && ABL != 22 && ABL != 23)) ? 1 : 0);
   const bool sync_on = (ABL < 2) || (ABL >= 13) || (ABL == 22) || (ABL == 23);
   const bool pld_on = (ABL < 2) || (ABL == 3) || (ABL == 21) || (ABL == 22) ||
                       (ABL == 23) || (ABL == 24);
@@ -1431,11 +1446,11 @@ __device__ __forceinline__ void attn64probe_body(
     // 批 A 的 softmax（ABL<2 或累加式变体 10~13 才有）
     if (sm_on) {
       bool risk = false;
-      if (risk_on) {
+      if (risk_mod && ((kt >> 6) % risk_mod == 0)) {
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
           const int ri = r0 + 4 * q;
-          const float lim = mlr[ri] + 8.f;
+          const float lim = mlr[ri] + 8.f * risk_mod;
           float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
           float x2 = TF[0]->x[q] * sc2, x3 = TF[1]->x[q] * sc2;
           risk |= fmaxf(fmaxf(x0, x1), fmaxf(x2, x3)) > lim;
@@ -1879,6 +1894,13 @@ int main(int argc, char** argv) {
                 16 * NWT16);
       run_probe("ABL24 exp近似 ", attn64probe<24>, SMEM16, abh, S, T, scale, NTH16,
                 16 * NWT16);
+      // 风险检测降频：每 2 轮 / 每 4 轮 / 不做（阈值同比放大到 8*N）
+      run_probe("ABL30 检/2轮   ", attn64probe<30>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL31 检/4轮   ", attn64probe<31>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL32 不检测   ", attn64probe<32>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
       // 2 block/SM：流水版的寄存器预算下，能忍受多少占用损失
       run_probe("ABL0@2block  ", attn64probe2<0>, SMEM16, abh, S, T, scale, NTH16,
                 16 * NWT16);
@@ -1893,6 +1915,13 @@ int main(int argc, char** argv) {
             bench_bh);
     run_one("attn64w16", attn64w16<false, false>, SMEM16, hQ, hK, hV, bh0, S, T,
             scale, bench_bh, nullptr, 0, 0.f, 0, NTH16, 16 * NWT16);
+    // 风险检测降频（每 2 / 4 轮一次，阈值 8→16/32，P 饱和保护）。
+    // 结论：sd=1 时快 7~8%、精度持平，但 sd=16 时 max_err 176（比例被饱和
+    // 压平），只在窄分布下成立，不能作为默认，故正式包不启用 RISKMOD>1。
+    run_one("attn64w16rm2", attn64w16<false, false, 0, 2>, SMEM16, hQ, hK, hV, bh0,
+            S, T, scale, bench_bh, nullptr, 0, 0.f, 0, NTH16, 16 * NWT16);
+    run_one("attn64w16rm4", attn64w16<false, false, 0, 4>, SMEM16, hQ, hK, hV, bh0,
+            S, T, scale, bench_bh, nullptr, 0, 0.f, 0, NTH16, 16 * NWT16);
   }
   free(hQ); free(hK); free(hV);
   if (hM) free(hM);
