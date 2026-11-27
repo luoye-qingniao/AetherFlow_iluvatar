@@ -175,6 +175,10 @@ password: <口令随机器单独下发，不入库>
       0.6110 ms / 56.2 TF，快 2.4×）**；bwd/causal/GQA/alibi/变长是功能
       缺口；dropout 的 Philox 与自研 murmur3 不兼容
       （见"官方 ixattention-backend 对照"）
+- [x] D=128 自研 flash 探针（第八轮）：同构单结构实测 **1.1480 ms / 29.9 TF**
+      （rel 4.1e-4），是物化的 1.30×，仍慢官方 1.88×。smem 49 KB → 2 block/SM，
+      每 warp 输出 fragment 4→8，利用率只有 D=64 的一半。**未落地**，见
+      "D=128 自研探针"
 
 ## 训练层接入（框架侧唯一改动）
 
@@ -1073,6 +1077,60 @@ H2D/D2H"口径一致；同形状数值对拍（f16，S=T=512）rel ≤ 7.8e-4。
 4. dropout 语义不兼容（Philox vs murmur3）。接入官方库会破坏与 CUDA 后端
    的逐位一致性，训练复现性断掉。
 
+### D=128 自研探针（2026-11-27，第八轮）
+
+上一节留的问题是"自研 flash 结构在 D=128 能跑到多少"。没有改包，先写了一个
+同构的独立探针 `bench/tcu_d128_probe.cu`（只在 bench 里，plain 模式，无
+mask/dropout），用实测数字回答。
+
+结构：与 D=64 定案完全同构——16 warp × 16 行 = 256 行/block、1024 线程、
+每轮 64 key（两批各 32，QK 双批并行取 ILP）、惰性基准、分母走 `P@ones` 的
+mma。差异只在 D=128 带来的量级变化：
+
+- smem 从 33792 B 涨到 **50176 B**（K 两批 16 KB + V 两批 16 KB + P 16 KB
+  + ones 1 KB），超过 48 KB 默认上限，`main` 里必须
+  `cudaFuncSetAttribute(attn128w16, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM128)`；
+- 每 SM 只能放 **2 个 block**（`__launch_bounds__(NTH16, 2)`），D=64 是 3 个；
+- 每 warp 的输出 fragment 从 4 个涨到 **8 个**（o0~o7），加分母 o8，共 9 组
+  accumulator 常驻 → 寄存器压力顶到 128 门槛（262144/(1024×2)）。
+
+实测（B=256，S=T=512，f16，reps=20，与第七轮同机同口径）：
+
+| 路径 | 耗时 | 算力 | 相对 |
+| --- | --- | --- | --- |
+| GEMM 物化（包内现状） | 1.4944 ms | 23.0 TF | 1.00× |
+| **自研 D=128 flash 探针** | **1.1480 ms** | **29.9 TF** | **1.30×** |
+| 官方 `ixattention-backend` | 0.6110 ms | 56.2 TF | 2.45× |
+
+数值对拍（`./_af_d128 4 512 2 8`，head 0~3 前 8 行与 double 参考比）：
+`max_err = 1.143e-04`，`rel ≈ 4.1e-04`，与 D=64 快路径同量级，说明双批 QK、
+8 分块 PV、`P@ones` 求分母搬到大 D 都没有语义问题。
+
+编译运行（远端）：
+
+```
+export COREX_PATH=/usr/local/corex-5.0.0
+export LD_LIBRARY_PATH=$COREX_PATH/lib64:$LD_LIBRARY_PATH
+$COREX_PATH/bin/clang++ -x ivcore --cuda-path=$COREX_PATH -O2 \
+    -o _af_d128 bench/tcu_d128_probe.cu -L$COREX_PATH/lib -lcudart
+./_af_d128 256 512 20      # 测速
+./_af_d128 4 512 2 8       # 对拍（第 4 个参数 = 校验行数）
+```
+
+结论：
+
+1. **自研结构在 D=128 上是 1.30×，不是预估的 1.2~1.6× 上限，也没摸到 57 TF。**
+   只有 29.9 TF，约为 D=64（57.4 TF）的一半——计算量翻倍而时间只涨 1.9×，
+   但并行度同时也掉了：block/SM 3→2（-33% 的常驻 warp），每 warp 输出
+   fragment 4→8（softmax 阶段要串行处理 8 组 rescale）。这两个损失叠在一起
+   把 TCU 利用率压到一半。
+2. **离官方还差 1.88×**。官方 56 TF 说明它的 tiling 与指令用法完全不是
+   "把 D=64 结构放大"能追上的（很可能是 128 列一次 mma、或不同的 K/V 复用
+   策略）。想靠自研 D=128 追平官方，等于要重做一遍结构，收益不明。
+3. **落地决策**：自研 D=128 的价值是 0.35 ms/次（1.4944→1.1480），代价是
+   4 模式 codegen + 全量回归；不落地则 D=128 继续走物化，功能正确、慢 1.3×。
+   两条路都远不如"环境里有 `libixattnbkd` 就开可选的 0.61 ms 快路径"。
+
 ### 明天接着做
 
 - [x] ~~**验证 Δ 平移**~~ **已放弃**：exp 前统一减 `mn + Δ` 属于
@@ -1112,13 +1170,14 @@ H2D/D2H"口径一致；同形状数值对拍（f16，S=T=512）rel ≤ 7.8e-4。
       bwd / causal / GQA / alibi / 变长属功能缺口；dropout 的 Philox 与自研
       murmur3 不兼容（接入会破坏与 CUDA 后端的逐位一致）。
 - [ ] **D=E=128 的 attention**（当前唯一明确的性能缺口，实测 2.4×）：
-      物化真值已量到 **1.4944 ms / 23.0 TF**（mask 1.7179 / 20.0）。
-      两条路二选一：
-      - 自研 D=128 flash 内核：计算量翻倍 + smem 涨到 ~49 KB（3→2 block/SM），
-        预估 0.9~1.3 ms，只能追到物化的 1.2~1.6×，仍需重扫结构验证；
+      物化真值已量到 **1.4944 ms / 23.0 TF**（mask 1.7179 / 20.0）；
+      自研探针已量到 **1.1480 ms / 29.9 TF**（1.30×，第八轮），仍未落地。
+      三条路待选：
+      - 落地自研 D=128：+0.35 ms/次，需 4 模式 codegen + 全量回归，收益有限；
       - "环境里有 `libixattnbkd` 才启用"的可选快路径：性能直接到 0.61 ms，
-        代价是多一套语义分支 + Philox 与 murmur3 不兼容的 dropout 特判。
-      先做小实验（D=128 单 block 结构的 bench）再定，不要直接改包。
+        代价是多一套语义分支 + Philox 与 murmur3 不兼容的 dropout 特判；
+      - 都不做：D=128 继续走物化（正确，慢 1.3×）。
+      需要先确认真实负载是否 head_dim=128，再决定要不要为它付成本。
 
 ### 本轮随手记的坑
 
