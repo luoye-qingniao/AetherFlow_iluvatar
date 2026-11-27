@@ -68,8 +68,8 @@ warp=64 的影响：现有模板只按 block 内线程索引 + `__syncthreads` �
 ### 旧机（2026-11-21，已停）
 
 ```
-ssh -p 11155 ubuntu@39.156.149.45
-password: K4QgJolw
+ssh -p <端口> ubuntu@<主机>
+password: <口令另行索取，不入库>
 ```
 
 - Ubuntu 24.04 / Python 3.12.3 / 6 核 / 9GB 内存 / 174GB 磁盘
@@ -86,8 +86,8 @@ password: K4QgJolw
 ### 新机（2026-11-22，端口单独下发，机器随用随换）
 
 ```
-ssh -p 11161 ubuntu@39.156.149.45
-password: orh0GGQ7
+ssh -p <端口> ubuntu@<主机>
+password: <口令随机器单独下发，不入库>
 ```
 
 - 新机是**裸镜像 + 只装了驱动**，与旧机不同，不能直接跑包：
@@ -165,6 +165,10 @@ password: orh0GGQ7
       物化基线的 2.33×）；mask **0.8481**、dropout **0.8812**、mask+dropout
       **1.2721**。真机四模式 max_err 4.2e-5~4.7e-5、NaN=0，全量 conformance
       104/7/0、68/68 ops（见"load_kv 4 字节化"与"mask/dropout 结构重排"）
+- [x] 官方 `ixattention-backend` 对照（第七轮）：D=E=64 自研更快，不接；
+      **D=128 是唯一明确的性能缺口（官方快约 3.5×）**；bwd/causal/GQA/alibi/
+      变长是功能缺口；dropout 的 Philox 与自研 murmur3 不兼容
+      （见"官方 ixattention-backend 对照"）
 
 ## 训练层接入（框架侧唯一改动）
 
@@ -998,6 +1002,59 @@ q/k/v 幅度 0.5，f16 直接喂图）：四模式 max_err
 分叉重写（DBG 测量参数不进包）；`backend.py` launcher 不变（1024 线程、
 grid `-(-s_len // 256)`、smem 33792 B 早已对齐）。
 
+### 官方 ixattention-backend 对照（2026-11-27，第七轮）
+
+动机：回答"官方高性能库能不能直接拿来用"。此前的判断（"公开栈里没有
+attention"）只对 toolkit 成立——`corex-toolkit` 里确实没有，但社区单独发布了
+`ixattention-backend-5.0.0-x86_64.run`，能力比自写内核宽得多。
+
+安装（Ubuntu 24.04 新机，toolkit 5.0.0）：
+
+```
+sudo ./corex-installer --silent --toolkit --skip-spacecheck \
+     --install-path /usr/local/corex-5.0.0
+```
+
+- **必须 sudo**：普通用户直接执行报 `Permission denied`（不是 noexec）。
+- `ixattention-backend` 是 sdk 子模块包，解包后只有 `include/` + `lib64/`
+  两个目录，`cp -a` 合并进 toolkit 即可（toolkit 里 `lib -> lib64` 是符号链接）；
+  它自带的 `corex-sdk-submodule-installer` 需要 `--submodule-name`，不填会
+  `Submodule name is empty`。
+- 包内是 `libixattnbkd.so`（36 KB dispatcher）+ `libixattnbkd_fwd.so.1`
+  （541 MB）+ `libixattnbkd_bwd.so.1`（629 MB）+ `libixattnbkd_acc.so.1`
+  （159 MB）。头文件 `ixattnbkd.h` 191 行。
+
+API 能力（超出自写内核的部分）：fwd **和 bwd**、加性 mask、`is_causal`、
+alibi、softcap、GQA（`head_num_kv`）、变长（`cu_seq_q/k`）、
+`head_dim_qk != head_dim_v`；dropout 走 **Philox**（PyTorch 兼容），
+不是我们的 murmur3；`imp_mode` 三档 PERF / MEM / ATOMICADD。
+
+踩坑：`lseDesc` 必须显式构造。默认构造的空 desc 里 `dataType` 是未初始化
+值，库拿它做分支会在 `ixAttnBkdFlashAttnForward` 里直接段错误（栈上连
+`[7] fwd returned` 都打不出来）。`PERF` 模式的 workspace 返回 0。
+
+实测（512×512×64，bh=256，f16，reps=20，同一台机同一次编译）：
+
+| 形状 | 自研 | 官方 ixattention | 结论 |
+| --- | --- | --- | --- |
+| 64，plain | **0.5986 ms / 57.4 TF** | 0.4157 ms / 41.3 TF | 自研快 44% |
+| 64，mask | **0.8442 ms / 40.7 TF** | 0.5378 ms / 31.9 TF | 自研快 57% |
+| 128，plain | 物化（约 2.2 ms / 15 TF，估算） | **0.6110 ms / 56.2 TF** | 官方快 ~3.5× |
+| 128，mask | —（走物化） | **0.7314 ms / 47.0 TF** | — |
+
+官方 mask 传全 0 加性 f16 mask 时，输出 sum 与 plain 逐位相同（
+`-23107.835493`），说明 mask 路径本身正确；`bad=0`。
+
+结论：
+
+1. **D=E=64 不接官方库**。自研快 36~57%，且自包含、Apache-2.0、不引入
+   1.3 GB 私有 `.so`。
+2. **D=128 是真实缺口**，不是性能微调能填的（差 3.5×）。要么补自研
+   D=128 内核，要么做"环境里有 ixattention 才走它"的可选路径。
+3. **bwd / causal / GQA / alibi / 变长是功能缺口**，与性能无关。
+4. dropout 语义不兼容（Philox vs murmur3）。接入官方库会破坏与 CUDA 后端
+   的逐位一致性，训练复现性断掉。
+
 ### 明天接着做
 
 - [x] ~~**验证 Δ 平移**~~ **已放弃**：exp 前统一减 `mn + Δ` 属于
@@ -1031,6 +1088,16 @@ grid `-(-s_len // 256)`、smem 33792 B 早已对齐）。
 - [x] mask/dropout 预检按 `HAS_MASK` 分叉 → 回填 `codegen.py`（w16 结构，
       无 DBG）→ 重打包 → 真机四模式 max_err ≤ 4.7e-5、NaN=0 →
       conformance **104/7/0，68/68 ops**（bench：m -5.9%、md -11.3%）。
+- [x] 官方 `ixattention-backend` 对照：安装并实测。**D=E=64 自研快 36~57%
+      （plain 44%、mask 57%），确认不接**；**D=128 官方快约 3.5×**
+      （0.6110 ms / 56.2 TF vs 物化估算 2.2 ms / 15 TF），是真实能力缺口；
+      bwd / causal / GQA / alibi / 变长属功能缺口；dropout 的 Philox 与自研
+      murmur3 不兼容（接入会破坏与 CUDA 后端的逐位一致）。
+- [ ] **D=E=128 的 attention**（当前唯一明确的性能缺口，3.5×）：
+      先把物化路径的真实耗时量出来（现在 2.2 ms / 15 TF 是估算），
+      再决定是自研 D=128 内核（D=128 时 smem/寄存器翻倍，可能掉到 2 block/SM，
+      需要重新扫结构），还是做"环境里有 `libixattnbkd` 才启用"的可选快路径
+      （代价：多一套语义分支 + Philox 不兼容的 dropout 特判）。
 
 ### 本轮随手记的坑
 
@@ -1040,16 +1107,16 @@ grid `-(-s_len // 256)`、smem 33792 B 早已对齐）。
     plain 全问题 67.1M 次 exp2 仅值 **0.045 ms**，SFU 根本不是瓶颈。
 15. **`err = 0` 可能是假象**：输出全 NaN/Inf 时 `fabs(nan - ref) > max` 恒
     false。bench 里要单独数 `if (got != got) ++nbad;`，用 `bad=` 报告。
-16. 探测脚本放在 `%TEMP%`（paramiko，`ssh -p 11161 ubuntu@39.156.149.45`
-    / 密码 `orh0GGQ7`）推送执行；`ivc_run.py` 上传 `bench/tcu_flash_attn.cu`
+16. 探测脚本放在 `%TEMP%`（paramiko，连接参数走临时环境变量，不入库）
+    推送执行；`ivc_run.py` 上传 `bench/tcu_flash_attn.cu`
     并用 `/usr/local/corex-5.0.0/bin/clang++` 编译（**必须写绝对路径**，
     PowerShell 会吞 `$COREX_PATH`；也不必先设 PATH）；运行参数 `T<nn>`
     = `./tcu_flash_attn 0 1 <nn>`，其他原样传递（`256` = bench）。
     **用完即删**，结论只留在本文件。注意 `py -3.10 x.py '<cmd>'` 里带管道
     的命令会被 shell 吃掉，只用单条无管道命令。
-16. 清理进程曾把 `.git/index.lock` 移进回收站。不要用工具恢复；git 报锁错误
+17. 清理进程曾把 `.git/index.lock` 移进回收站。不要用工具恢复；git 报锁错误
     时直接删掉该锁文件即可。
-17. **天数机器可能是"只装驱动"的裸镜像**：`/usr/local/corex-5.0.0` 仅 18 MB，
+18. **天数机器可能是"只装驱动"的裸镜像**：`/usr/local/corex-5.0.0` 仅 18 MB，
     没有 cudart / cublas / clang++ / include。此时硬件包装得上但
     `get_backend` 报找不到 `libcudart.so.10.2`。按「远端验证机 → 新机」
     的链接装 toolkit 再试，不要怀疑硬件包或 manifest。
