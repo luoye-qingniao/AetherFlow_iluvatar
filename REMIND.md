@@ -130,6 +130,11 @@ password: <口令随机器单独下发，不入库>
   CUDA 10.2，`/dev/iluvatar0` 存在
 - 注意：`tar` 解出来的源码 + venv 只有几百 MB；真正的大件是
   `/usr/local/corex-5.0.0`（5.5 GB）。换机重建的主要成本就是那 1.7 GB 下载。
+- 2026-11-27 又换了一台机（toolkit 已装好、只缺 Python 环境），上面四步
+  依然有效，全套约 1 分钟：解 tar → `python3 -m venv ~/afenv` →
+  `pip install -U numpy`（清华源）→ `install_hardware(zip, replace=True)`。
+  **跑任何命令前都要先 export `LD_LIBRARY_PATH=$COREX_PATH/lib64`**，
+  否则报错与"裸镜像"完全一样（见"坑 19"）。
 
 ## 进度
 
@@ -166,8 +171,9 @@ password: <口令随机器单独下发，不入库>
       **1.2721**。真机四模式 max_err 4.2e-5~4.7e-5、NaN=0，全量 conformance
       104/7/0、68/68 ops（见"load_kv 4 字节化"与"mask/dropout 结构重排"）
 - [x] 官方 `ixattention-backend` 对照（第七轮）：D=E=64 自研更快，不接；
-      **D=128 是唯一明确的性能缺口（官方快约 3.5×）**；bwd/causal/GQA/alibi/
-      变长是功能缺口；dropout 的 Philox 与自研 murmur3 不兼容
+      **D=128 是唯一明确的性能缺口（实测物化 1.4944 ms / 23.0 TF，官方
+      0.6110 ms / 56.2 TF，快 2.4×）**；bwd/causal/GQA/alibi/变长是功能
+      缺口；dropout 的 Philox 与自研 murmur3 不兼容
       （见"官方 ixattention-backend 对照"）
 
 ## 训练层接入（框架侧唯一改动）
@@ -1033,24 +1039,36 @@ alibi、softcap、GQA（`head_num_kv`）、变长（`cu_seq_q/k`）、
 值，库拿它做分支会在 `ixAttnBkdFlashAttnForward` 里直接段错误（栈上连
 `[7] fwd returned` 都打不出来）。`PERF` 模式的 workspace 返回 0。
 
-实测（512×512×64，bh=256，f16，reps=20，同一台机同一次编译）：
+实测（bh=256 = B×H，S=T=512，f16，reps=20，同一台机同一次编译）：
 
 | 形状 | 自研 | 官方 ixattention | 结论 |
 | --- | --- | --- | --- |
-| 64，plain | **0.5986 ms / 57.4 TF** | 0.4157 ms / 41.3 TF | 自研快 44% |
-| 64，mask | **0.8442 ms / 40.7 TF** | 0.5378 ms / 31.9 TF | 自研快 57% |
-| 128，plain | 物化（约 2.2 ms / 15 TF，估算） | **0.6110 ms / 56.2 TF** | 官方快 ~3.5× |
-| 128，mask | —（走物化） | **0.7314 ms / 47.0 TF** | — |
+| D=E=64，plain | **0.5986 ms / 57.4 TF**（flash 内核） | 0.4157 ms / 41.3 TF | 自研快 44% |
+| D=E=64，mask | **0.8442 ms / 40.7 TF**（flash 内核） | 0.5378 ms / 31.9 TF | 自研快 57% |
+| D=E=128，plain | 1.4944 ms / 23.0 TF（物化） | **0.6110 ms / 56.2 TF** | 官方快 2.4× |
+| D=E=128，mask | 1.7179 ms / 20.0 TF（物化） | **0.7314 ms / 47.0 TF** | 官方快 2.4× |
+
+自研两列口径：D=64 是指针直接进 `af_attn_w16` 内核；D=128 不满足
+`d==64` 快路径，走 `_op_attention` 的 GEMM 物化（QK^T → softmax → PV）。
+D=128 的测法是 `get_backend("iluvatar")._op_attention(node, [q,k,v], attrs)`
+直接调用、`rt.synchronize()` 夹 `perf_counter`，与内核 bench 的"排除
+H2D/D2H"口径一致；同形状数值对拍（f16，S=T=512）rel ≤ 7.8e-4。
+**D=128 的旧估算（2.2 ms / 15 TF）偏低，实测 1.49 ms / 23 TF，缺口是
+2.4× 而不是 3.5×。**
 
 官方 mask 传全 0 加性 f16 mask 时，输出 sum 与 plain 逐位相同（
 `-23107.835493`），说明 mask 路径本身正确；`bad=0`。
 
 结论：
 
-1. **D=E=64 不接官方库**。自研快 36~57%，且自包含、Apache-2.0、不引入
+1. **D=E=64 不接官方库**。自研快 44~57%，且自包含、Apache-2.0、不引入
    1.3 GB 私有 `.so`。
-2. **D=128 是真实缺口**，不是性能微调能填的（差 3.5×）。要么补自研
-   D=128 内核，要么做"环境里有 ixattention 才走它"的可选路径。
+2. **D=128 是真实缺口，但只有 2.4×**。物化路径的账能对上：两次 f16
+   batched GEMM 约 0.35 ms（97 TF 峰值），scores 128 MB 落 HBM 再读回
+   约 3 遍 ≈ 0.74 ms（522 GB/s），softmax 指令与 launch 摊余 ~0.4 ms。
+   自研 flash 结构若能维持 D=64 的 57 TF，理论值约 0.6 ms；但 D=128 时
+   smem 从 33.8 KB 涨到 ~49 KB、block/SM 从 3 掉到 2，预估落在
+   0.9~1.3 ms（估算，未实现），收益是物化的 1.2~1.6×，仍追不上官方。
 3. **bwd / causal / GQA / alibi / 变长是功能缺口**，与性能无关。
 4. dropout 语义不兼容（Philox vs murmur3）。接入官方库会破坏与 CUDA 后端
    的逐位一致性，训练复现性断掉。
@@ -1093,11 +1111,14 @@ alibi、softcap、GQA（`head_num_kv`）、变长（`cu_seq_q/k`）、
       （0.6110 ms / 56.2 TF vs 物化估算 2.2 ms / 15 TF），是真实能力缺口；
       bwd / causal / GQA / alibi / 变长属功能缺口；dropout 的 Philox 与自研
       murmur3 不兼容（接入会破坏与 CUDA 后端的逐位一致）。
-- [ ] **D=E=128 的 attention**（当前唯一明确的性能缺口，3.5×）：
-      先把物化路径的真实耗时量出来（现在 2.2 ms / 15 TF 是估算），
-      再决定是自研 D=128 内核（D=128 时 smem/寄存器翻倍，可能掉到 2 block/SM，
-      需要重新扫结构），还是做"环境里有 `libixattnbkd` 才启用"的可选快路径
-      （代价：多一套语义分支 + Philox 不兼容的 dropout 特判）。
+- [ ] **D=E=128 的 attention**（当前唯一明确的性能缺口，实测 2.4×）：
+      物化真值已量到 **1.4944 ms / 23.0 TF**（mask 1.7179 / 20.0）。
+      两条路二选一：
+      - 自研 D=128 flash 内核：计算量翻倍 + smem 涨到 ~49 KB（3→2 block/SM），
+        预估 0.9~1.3 ms，只能追到物化的 1.2~1.6×，仍需重扫结构验证；
+      - "环境里有 `libixattnbkd` 才启用"的可选快路径：性能直接到 0.61 ms，
+        代价是多一套语义分支 + Philox 与 murmur3 不兼容的 dropout 特判。
+      先做小实验（D=128 单 block 结构的 bench）再定，不要直接改包。
 
 ### 本轮随手记的坑
 
@@ -1120,3 +1141,17 @@ alibi、softcap、GQA（`head_num_kv`）、变长（`cu_seq_q/k`）、
     没有 cudart / cublas / clang++ / include。此时硬件包装得上但
     `get_backend` 报找不到 `libcudart.so.10.2`。按「远端验证机 → 新机」
     的链接装 toolkit 再试，不要怀疑硬件包或 manifest。
+19. **toolkit 装好了但没设 `LD_LIBRARY_PATH`，报错与"裸镜像"一模一样**。
+    报错信息只列 `libcudart.so.10.2 / .10 / .so` 三次失败，看不出是路径问题。
+    先 `ls /usr/local/corex-5.0.0/lib64/libcudart.so.10.2` 确认库在，
+    再
+    ```
+    export COREX_PATH=/usr/local/corex-5.0.0
+    export PATH=$COREX_PATH/bin:$PATH
+    export LD_LIBRARY_PATH=$COREX_PATH/lib64:$LD_LIBRARY_PATH
+    ```
+    `lib` 是 `lib64` 的符号链接，两个都行。
+20. **对拍时输入必须与测速共用同一份 host 数组**。曾在测速函数内重新采样
+    q/k/v，参考却用外层的另一组随机数，得到 `max_err=0.32` 的假 bug；
+    改成"量化一次、两边共用"后 rel ≤ 7.8e-4。f16 的量化误差在 D=128 时
+    本身就有 1e-4 量级，先排除参考口径再怀疑内核。
