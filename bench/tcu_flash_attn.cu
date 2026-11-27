@@ -1769,7 +1769,7 @@ static void run_probe(const char* tag, attn_kern kfn, size_t smem, int bh, int S
   float ms = 0.f;
   cudaEventElapsedTime(&ms, e0, e1);
   ms /= reps;
-  double fl = (double)bh * 4.0 * S * T * 64 * 2.0;
+  double fl = (double)bh * 4.0 * S * T * 64;  // 2 个 GEMM × 2 FLOP/MAC
   printf("[%s] regs=%d local=%d  %.4f ms  %.2f GFLOPS\n", tag, at.numRegs,
          (int)at.localSizeBytes, ms, fl / (ms * 1e-3) / 1e9);
   cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
@@ -1854,7 +1854,7 @@ static void run_one(const char* tag, attn_kern kfn, size_t smem, const __half* h
     cudaMemcpy(dQ, bQ, m * 2, cudaMemcpyHostToDevice);
     cudaMemcpy(dK, bK, m * 2, cudaMemcpyHostToDevice);
     cudaMemcpy(dV, bV, m * 2, cudaMemcpyHostToDevice);
-    double fl = (double)bench_bh * 4.0 * S * T * 64 * 2.0;
+    double fl = (double)bench_bh * 4.0 * S * T * 64;  // 2 个 GEMM × 2 FLOP/MAC
     const int reps = 20;
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0); cudaEventCreate(&e1);
@@ -2022,6 +2022,12 @@ int main(int argc, char** argv) {
             S, T, scale, bench_bh, nullptr, 0, 0.f, 0, NTH16, 16 * NWT16);
     run_one("attn64w16rm4", attn64w16<false, false, 0, 4>, SMEM16, hQ, hK, hV, bh0,
             S, T, scale, bench_bh, nullptr, 0, 0.f, 0, NTH16, 16 * NWT16);
+    // 强制 2 block/SM：动态 smem 撑到 50000 B（> 131072/3 = 43690），占用从 48 warp
+    // 降到 32 warp/SM。用来判断 D=128 纯 mma 只有 47.6 TF（61%）是不是 warp 数不足。
+    cudaFuncSetAttribute(attn64w16<false, false>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, 50000);
+    run_one("attn64w16@2blk", attn64w16<false, false>, 50000, hQ, hK, hV, bh0, S, T,
+            scale, bench_bh, nullptr, 0, 0.f, 0, NTH16, 16 * NWT16);
   }
   free(hQ); free(hK); free(hV);
   if (hM) free(hM);

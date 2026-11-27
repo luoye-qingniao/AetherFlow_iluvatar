@@ -1,6 +1,13 @@
-// D=128 单 block 结构探针：与 attn64w16 完全同构（16 warp × 16 行、每轮 64 key、
-// 两批 QK 并行、惰性基准、P@ones 求分母），仅把 D 从 64 扩到 128。
-// 只实现 plain（无 mask / dropout），目的是测"smem 49KB、2 block/SM"下的真实吞吐。
+// D=128 分段剥离探针：与 attn64w16 同构（每 warp 16 行、每轮 64 key、两批 QK
+// 并行、惰性基准、P@ones 求分母），仅把 D 从 64 扩到 128。只实现 plain。
+//
+// 第十一轮：用 ABL 模板开关逐段剥离，回答"D=128 的 1.148 ms 花在哪"。
+//   ABL=1  纯 mma（不搬 KV、不写 P、无 exp2、无检测；pa0 填常量）——mma 上限
+//   ABL=2  + 搬 KV（load_kv128 两批 + block 同步）
+//   ABL=3  + 写 P（p 直接取 s，无 exp2，无检测）
+//   ABL=4  + exp2（仍无风险检测）
+//   ABL=5  完整（+ 惰性基准风险检测）= 与第八轮基线同构
+// 各段成本 = 相邻两档之差。逐段数据与 D=64 第九轮口径一致，可直接对比。
 //
 // 编译运行：
 //   export COREX_PATH=/usr/local/corex-5.0.0
@@ -10,8 +17,9 @@
 //   ./_af_d128 256 512 20      # B S reps
 //   ./_af_d128 4 512 2 8       # 第 4 个参数 = 对拍校验行数
 //
-// 实测（B=256 S=T=512）：1.1480 ms / 29.9 TFLOPS，rel 4.1e-4
-// （物化 1.4944 ms，官方 ixattention 0.6110 ms，见 REMIND.md 第八轮）。
+// 第八轮实测（完整）：1.1480 ms / 29.9 TFLOPS（实际口径），rel 4.1e-4。
+// 注意：bench/tcu_flash_attn.cu 里 D=64 的 flops 公式末尾多乘了 2，显示值虚高
+// 一倍；本文件的 29.9 TFLOPS 是真实口径（D=64 真实为 29.6 TF，两者效率相同）。
 #include <crt/iluvatar_mma.h>
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -31,8 +39,6 @@ __host__ __device__ __forceinline__ int off_col(int row, int col) {
          ((r >> 2 & 1) ^ (col >> 2 & 1)) * 8 + (col & 3) * 2 + (row & 1);
 }
 
-#define NWT16 16
-#define NTH16 (NWT16 * 64)
 #define AF_LOG2E 1.4426950408889634f
 
 // 32 个 key、D=128 → 每批 4096 half（32x128）。K 每线程 2 个 d（一个 unsigned）；
@@ -52,23 +58,51 @@ __device__ __forceinline__ void load_kv128(__half* ks, __half* vs, const __half*
   }
 }
 
-__global__ void __launch_bounds__(NTH16, 2) attn128w16(
+// KV 预取（PF=1）：把下一轮 32 key 的 gmem 读提前到本轮 mma 之前发射，
+// 结果暂存寄存器，下一轮开头再写 smem。只对 nth==2048（w32）有效，
+// 此时每线程正好负责 1 个 idx（K 一个 32 位字 + V 一个 half2）。
+// 目的：把 w32 的 KV 段（0.128 ms，几乎全是 gmem 延迟）藏进本轮的 mma。
+struct kv2 {
+  unsigned k;
+  __half2 v;
+};
+
+__device__ __forceinline__ void ld_kv1(kv2& r, const __half* Kb0, const __half* Vb0,
+                                       int kb) {
+  const long long o = (long long)kb * 4096;
+  const int idx = threadIdx.x;
+  const int t = idx >> 6, d = (idx & 63) * 2;
+  r.k = ((const unsigned*)(Kb0 + o))[idx];
+  r.v = *(const __half2*)(Vb0 + o + ((long long)t << 7) + d);
+}
+
+__device__ __forceinline__ void st_kv1(__half* ks, __half* vs, const kv2& r) {
+  const int idx = threadIdx.x;
+  const int t = idx >> 6, d = (idx & 63) * 2;
+  ((unsigned*)ks)[(((t >> 4) * 4 + (d >> 5)) * 512 + off_col(d & 31, t & 15)) >> 1] = r.k;
+  vs[(d >> 4) * 512 + off_col(t, d & 15)] = __low2half(r.v);
+  vs[(d >> 4) * 512 + off_col(t, (d + 1) & 15)] = __high2half(r.v);
+}
+
+template <int NWT, int MINB, int ABL, int QB = 0, int PF = 0>
+__global__ void __launch_bounds__(NWT * 64, MINB) attn128w16(
     const __half* __restrict__ Q, const __half* __restrict__ K,
     const __half* __restrict__ V, __half* __restrict__ O, int S, int T,
     float scale) {
+  const int nth = NWT * 64;
   extern __shared__ __half sm[];
   __half* ksm = sm;                       // 两批 K，各 4096
   __half* vsm = ksm + 8192;               // 两批 V，各 4096
   __half* psm = vsm + 8192;               // 每 warp 一个 16x32 的 P
-  __half* ones_sm = psm + NWT16 * 512;    // 16x16 全 1
-  __shared__ float mls[NWT16 * 16];
+  __half* ones_sm = psm + NWT * 512;      // 16x16 全 1
+  __shared__ float mls[NWT * 16];
 
   const int warp = threadIdx.x >> 6;
   const int lane = threadIdx.x & 63;
   const int r0 = lane >> 4;
   const int c0 = lane & 15;
   const int bh = blockIdx.y;
-  const int row_base = blockIdx.x * (16 * NWT16) + warp * 16;
+  const int row_base = blockIdx.x * (16 * NWT) + warp * 16;
 
   const __half* Qb = Q + (long long)bh * S * 128;
   __half* Ob = O + (long long)bh * S * 128;
@@ -77,7 +111,8 @@ __global__ void __launch_bounds__(NTH16, 2) attn128w16(
   __half* pw = psm + warp * 512;
 
   fragment<matrix_a, 16, 16, 32, __half, row_major> a0, a1, a2, a3, pa0;
-  fragment<matrix_b, 16, 16, 32, __half, col_major> b0, b1, b2, b3, vbo;
+  fragment<matrix_b, 16, 16, 32, __half, col_major> b0, b1, b2, b3, b4, b5, b6, b7,
+      vbo;
   fragment<accumulator, 16, 16, 32, float> s0, s1;
   fragment<accumulator, 16, 16, 32, float> t0, t1;
   fragment<accumulator, 16, 16, 32, float> o0, o1, o2, o3, o4, o5, o6, o7, o8;
@@ -107,8 +142,8 @@ __global__ void __launch_bounds__(NTH16, 2) attn128w16(
 #pragma unroll
   for (int e = 0; e < 9; ++e) fill_fragment(*OF[e], 0.f);
 
-  for (int idx = threadIdx.x; idx < NWT16 * 16; idx += NTH16) mls[idx] = -1e30f;
-  for (int idx = threadIdx.x; idx < 512; idx += NTH16) {
+  for (int idx = threadIdx.x; idx < NWT * 16; idx += nth) mls[idx] = -1e30f;
+  for (int idx = threadIdx.x; idx < 512; idx += nth) {
     int t = idx >> 4, dd = idx & 15;
     ones_sm[off_col(t, dd)] = __float2half(1.f);
   }
@@ -118,58 +153,117 @@ __global__ void __launch_bounds__(NTH16, 2) attn128w16(
   const float sc2 = scale * AF_LOG2E;
   float* mlr = mls + warp * 16;
 
+  kv2 pr[2];
+  if (PF == 1) {
+    ld_kv1(pr[0], Kb0, Vb0, 0);
+    if (T > 32) ld_kv1(pr[1], Kb0, Vb0, 1);
+  }
+
   for (int kt = 0; kt < T; kt += 64) {
     const bool hasB = (kt + 32 < T);
-    load_kv128(ksm, vsm, Kb0, Vb0, kt >> 5, NTH16);
-    if (hasB) load_kv128(ksm + 4096, vsm + 4096, Kb0, Vb0, (kt >> 5) + 1, NTH16);
-    __syncthreads();
+    if (PF == 1) {
+      // 轮末同步挪到轮首：保证上一轮 PV 已读完 smem 再覆盖
+      __syncthreads();
+      st_kv1(ksm, vsm, pr[0]);
+      if (hasB) st_kv1(ksm + 4096, vsm + 4096, pr[1]);
+      // 立刻发射下一轮的 gmem 读，延迟由本轮 QK/P/PV 掩盖
+      const int nk = kt + 64;
+      if (nk < T) ld_kv1(pr[0], Kb0, Vb0, nk >> 5);
+      if (nk + 32 < T) ld_kv1(pr[1], Kb0, Vb0, (nk >> 5) + 1);
+      __syncthreads();
+    } else {
+      if (ABL >= 2) {
+        load_kv128(ksm, vsm, Kb0, Vb0, kt >> 5, nth);
+        if (hasB) load_kv128(ksm + 4096, vsm + 4096, Kb0, Vb0, (kt >> 5) + 1, nth);
+      }
+      __syncthreads();
+    }
 
-    // 批 A 的 QK：4 段 D 维
+    // 批 A 的 QK：4 段 D 维（所有档都做，纯 mma 上限也要它）
     fill_fragment(s0, 0.f);
     fill_fragment(s1, 0.f);
-    load_matrix_sync(b0, ksm, 32);
-    load_matrix_sync(b1, ksm + 512, 32);
-    load_matrix_sync(b2, ksm + 1024, 32);
-    load_matrix_sync(b3, ksm + 1536, 32);
-    mma_sync(s0, a0, b0, s0);
-    mma_sync(s0, a1, b1, s0);
-    mma_sync(s0, a2, b2, s0);
-    mma_sync(s0, a3, b3, s0);
-    load_matrix_sync(b0, ksm + 2048, 32);
-    load_matrix_sync(b1, ksm + 2560, 32);
-    load_matrix_sync(b2, ksm + 3072, 32);
-    load_matrix_sync(b3, ksm + 3584, 32);
-    mma_sync(s1, a0, b0, s1);
-    mma_sync(s1, a1, b1, s1);
-    mma_sync(s1, a2, b2, s1);
-    mma_sync(s1, a3, b3, s1);
+    if (QB == 0) {
+      load_matrix_sync(b0, ksm, 32);
+      load_matrix_sync(b1, ksm + 512, 32);
+      load_matrix_sync(b2, ksm + 1024, 32);
+      load_matrix_sync(b3, ksm + 1536, 32);
+      mma_sync(s0, a0, b0, s0);
+      mma_sync(s0, a1, b1, s0);
+      mma_sync(s0, a2, b2, s0);
+      mma_sync(s0, a3, b3, s0);
+      load_matrix_sync(b0, ksm + 2048, 32);
+      load_matrix_sync(b1, ksm + 2560, 32);
+      load_matrix_sync(b2, ksm + 3072, 32);
+      load_matrix_sync(b3, ksm + 3584, 32);
+      mma_sync(s1, a0, b0, s1);
+      mma_sync(s1, a1, b1, s1);
+      mma_sync(s1, a2, b2, s1);
+      mma_sync(s1, a3, b3, s1);
+    } else {
+      // 两组 b 寄存器：两批 32 key 的 QK 交错发射，把 4 条串行链拆成 2 路并行
+      load_matrix_sync(b0, ksm, 32);
+      load_matrix_sync(b1, ksm + 512, 32);
+      load_matrix_sync(b2, ksm + 1024, 32);
+      load_matrix_sync(b3, ksm + 1536, 32);
+      load_matrix_sync(b4, ksm + 2048, 32);
+      load_matrix_sync(b5, ksm + 2560, 32);
+      load_matrix_sync(b6, ksm + 3072, 32);
+      load_matrix_sync(b7, ksm + 3584, 32);
+      mma_sync(s0, a0, b0, s0);
+      mma_sync(s1, a0, b4, s1);
+      mma_sync(s0, a1, b1, s0);
+      mma_sync(s1, a1, b5, s1);
+      mma_sync(s0, a2, b2, s0);
+      mma_sync(s1, a2, b6, s1);
+      mma_sync(s0, a3, b3, s0);
+      mma_sync(s1, a3, b7, s1);
+    }
 
     if (hasB) {
       fill_fragment(t0, 0.f);
       fill_fragment(t1, 0.f);
-      load_matrix_sync(b0, ksm + 4096, 32);
-      load_matrix_sync(b1, ksm + 4096 + 512, 32);
-      load_matrix_sync(b2, ksm + 4096 + 1024, 32);
-      load_matrix_sync(b3, ksm + 4096 + 1536, 32);
-      mma_sync(t0, a0, b0, t0);
-      mma_sync(t0, a1, b1, t0);
-      mma_sync(t0, a2, b2, t0);
-      mma_sync(t0, a3, b3, t0);
-      load_matrix_sync(b0, ksm + 4096 + 2048, 32);
-      load_matrix_sync(b1, ksm + 4096 + 2560, 32);
-      load_matrix_sync(b2, ksm + 4096 + 3072, 32);
-      load_matrix_sync(b3, ksm + 4096 + 3584, 32);
-      mma_sync(t1, a0, b0, t1);
-      mma_sync(t1, a1, b1, t1);
-      mma_sync(t1, a2, b2, t1);
-      mma_sync(t1, a3, b3, t1);
+      if (QB == 0) {
+        load_matrix_sync(b0, ksm + 4096, 32);
+        load_matrix_sync(b1, ksm + 4096 + 512, 32);
+        load_matrix_sync(b2, ksm + 4096 + 1024, 32);
+        load_matrix_sync(b3, ksm + 4096 + 1536, 32);
+        mma_sync(t0, a0, b0, t0);
+        mma_sync(t0, a1, b1, t0);
+        mma_sync(t0, a2, b2, t0);
+        mma_sync(t0, a3, b3, t0);
+        load_matrix_sync(b0, ksm + 4096 + 2048, 32);
+        load_matrix_sync(b1, ksm + 4096 + 2560, 32);
+        load_matrix_sync(b2, ksm + 4096 + 3072, 32);
+        load_matrix_sync(b3, ksm + 4096 + 3584, 32);
+        mma_sync(t1, a0, b0, t1);
+        mma_sync(t1, a1, b1, t1);
+        mma_sync(t1, a2, b2, t1);
+        mma_sync(t1, a3, b3, t1);
+      } else {
+        load_matrix_sync(b0, ksm + 4096, 32);
+        load_matrix_sync(b1, ksm + 4096 + 512, 32);
+        load_matrix_sync(b2, ksm + 4096 + 1024, 32);
+        load_matrix_sync(b3, ksm + 4096 + 1536, 32);
+        load_matrix_sync(b4, ksm + 4096 + 2048, 32);
+        load_matrix_sync(b5, ksm + 4096 + 2560, 32);
+        load_matrix_sync(b6, ksm + 4096 + 3072, 32);
+        load_matrix_sync(b7, ksm + 4096 + 3584, 32);
+        mma_sync(t0, a0, b0, t0);
+        mma_sync(t1, a0, b4, t1);
+        mma_sync(t0, a1, b1, t0);
+        mma_sync(t1, a1, b5, t1);
+        mma_sync(t0, a2, b2, t0);
+        mma_sync(t1, a2, b6, t1);
+        mma_sync(t0, a3, b3, t0);
+        mma_sync(t1, a3, b7, t1);
+      }
     } else {
       fill_fragment(t0, -1e30f);
       fill_fragment(t1, -1e30f);
     }
 
-    // 惰性基准预检（plain 专用 pass）
-    {
+    // 惰性基准预检（ABL>=5 才有；低档不做）
+    if (ABL >= 5) {
       bool risk = false;
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
@@ -201,24 +295,34 @@ __global__ void __launch_bounds__(NTH16, 2) attn128w16(
       }
     }
 
-    __syncwarp();
-    // 批 A 写 P
-    {
+    // 批 A 写 P（ABL>=3）
+    if (ABL >= 3) {
+      __syncwarp();
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
-        const int ri = r0 + 4 * q;
-        const float mn = mlr[ri];
-        float p0 = exp2f(SF[0]->x[q] * sc2 - mn);
-        float p1 = exp2f(SF[1]->x[q] * sc2 - mn);
+        float p0, p1;
+        if (ABL >= 4) {
+          const float mn = mlr[r0 + 4 * q];
+          p0 = exp2f(SF[0]->x[q] * sc2 - mn);
+          p1 = exp2f(SF[1]->x[q] * sc2 - mn);
+        } else {
+          p0 = SF[0]->x[q];
+          p1 = SF[1]->x[q];
+        }
         const int row = r0 + 4 * q;
         pw[off_row(row, c0)] = __float2half(p0);
         pw[off_row(row, 16 + c0)] = __float2half(p1);
       }
+      __syncwarp();
+    } else {
+      // 低档不写 P：用易失写保活 QK 结果，防止 mma 被当成死代码删掉
+      volatile float sink = s0.x[0] + s1.x[0] + t0.x[0] + t1.x[0];
+      (void)sink;
     }
-    __syncwarp();
 
-    // 批 A 的 PV：8 个 E 分块 + 分母
-    load_matrix_sync(pa0, pw, 32);
+    // 批 A 的 PV：8 个 E 分块 + 分母（所有档都做）
+    if (ABL >= 3) load_matrix_sync(pa0, pw, 32);
+    else fill_fragment(pa0, (unsigned)0);
     load_matrix_sync(b0, vsm, 32);
     load_matrix_sync(b1, vsm + 512, 32);
     load_matrix_sync(b2, vsm + 1024, 32);
@@ -238,19 +342,27 @@ __global__ void __launch_bounds__(NTH16, 2) attn128w16(
     mma_sync(o8, pa0, vbo, o8);
 
     if (hasB) {
-      __syncwarp();
+      if (ABL >= 3) {
+        __syncwarp();
 #pragma unroll
-      for (int q = 0; q < 4; ++q) {
-        const int ri = r0 + 4 * q;
-        const float mn = mlr[ri];
-        float p0 = exp2f(TF[0]->x[q] * sc2 - mn);
-        float p1 = exp2f(TF[1]->x[q] * sc2 - mn);
-        const int row = r0 + 4 * q;
-        pw[off_row(row, c0)] = __float2half(p0);
-        pw[off_row(row, 16 + c0)] = __float2half(p1);
+        for (int q = 0; q < 4; ++q) {
+          float p0, p1;
+          if (ABL >= 4) {
+            const float mn = mlr[r0 + 4 * q];
+            p0 = exp2f(TF[0]->x[q] * sc2 - mn);
+            p1 = exp2f(TF[1]->x[q] * sc2 - mn);
+          } else {
+            p0 = TF[0]->x[q];
+            p1 = TF[1]->x[q];
+          }
+          const int row = r0 + 4 * q;
+          pw[off_row(row, c0)] = __float2half(p0);
+          pw[off_row(row, 16 + c0)] = __float2half(p1);
+        }
+        __syncwarp();
       }
-      __syncwarp();
-      load_matrix_sync(pa0, pw, 32);
+      if (ABL >= 3) load_matrix_sync(pa0, pw, 32);
+      else fill_fragment(pa0, (unsigned)0);
       load_matrix_sync(b0, vsm + 4096, 32);
       load_matrix_sync(b1, vsm + 4096 + 512, 32);
       load_matrix_sync(b2, vsm + 4096 + 1024, 32);
@@ -269,7 +381,7 @@ __global__ void __launch_bounds__(NTH16, 2) attn128w16(
       mma_sync(o7, pa0, b3, o7);
       mma_sync(o8, pa0, vbo, o8);
     }
-    __syncthreads();
+    if (PF == 0) __syncthreads();
   }
 
 #pragma unroll
@@ -284,7 +396,10 @@ __global__ void __launch_bounds__(NTH16, 2) attn128w16(
 }
 
 // ---------------------------------------------------------------- bench
-static const size_t SMEM128 = (4096 + 4096 + 4096 + 4096 + NWT16 * 512 + 512) * 2;
+// 动态 smem：K 两批 8192 + V 两批 8192 + P NWT*512 + ones 512（单位 half）。
+static size_t smem_bytes(int nwt) {
+  return (size_t)(8192 + 8192 + nwt * 512 + 512) * 2;
+}
 
 static __half* mk_gauss(size_t n, int seed, float sd) {
   __half* h = (__half*)malloc(n * sizeof(__half));
@@ -325,6 +440,32 @@ static void ref_rows(const __half* Q, const __half* K, const __half* V, int S, i
   free(sc);
 }
 
+template <int NWT, int MINB, int ABL, int QB = 0, int PF = 0>
+static void run(const char* name, const __half* dQ, const __half* dK, const __half* dV,
+                __half* dO, int B, int S, int T, float scale, int reps) {
+  const size_t sm = smem_bytes(NWT);
+  cudaFuncSetAttribute(attn128w16<NWT, MINB, ABL, QB, PF>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+  cudaFuncAttributes fa;
+  cudaFuncGetAttributes(&fa, attn128w16<NWT, MINB, ABL, QB, PF>);
+  dim3 grid((S + 16 * NWT - 1) / (16 * NWT), B);
+  for (int i = 0; i < 3; ++i)
+    attn128w16<NWT, MINB, ABL, QB, PF><<<grid, NWT * 64, sm>>>(dQ, dK, dV, dO, S, T, scale);
+  cudaDeviceSynchronize();
+  cudaEvent_t e0, e1;
+  cudaEventCreate(&e0); cudaEventCreate(&e1);
+  cudaEventRecord(e0);
+  for (int i = 0; i < reps; ++i)
+    attn128w16<NWT, MINB, ABL, QB, PF><<<grid, NWT * 64, sm>>>(dQ, dK, dV, dO, S, T, scale);
+  cudaEventRecord(e1); cudaEventSynchronize(e1);
+  float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+  ms /= reps;
+  double flops = 4.0 * B * S * T * 128.0;
+  printf("  %-22s %.4f ms  %.1f TFLOPS  regs=%d smem=%zu grid=%dx%d\n", name,
+         (double)ms, flops / ((double)ms * 1e-3) * 1e-12, fa.numRegs, sm, grid.x,
+         grid.y);
+}
+
 int main(int argc, char** argv) {
   const int B = argc > 1 ? atoi(argv[1]) : 256;
   const int S = argc > 2 ? atoi(argv[2]) : 512;
@@ -343,24 +484,45 @@ int main(int argc, char** argv) {
   cudaMemcpy(dQ, hQ, nq * 2, cudaMemcpyHostToDevice);
   cudaMemcpy(dK, hK, nk * 2, cudaMemcpyHostToDevice);
   cudaMemcpy(dV, hV, nk * 2, cudaMemcpyHostToDevice);
-  cudaFuncSetAttribute(attn128w16, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM128);
-  dim3 grid((S + 255) / 256, B);
 
-  for (int i = 0; i < 3; ++i)
-    attn128w16<<<grid, NTH16, SMEM128>>>(dQ, dK, dV, dO, S, T, scale);
-  cudaDeviceSynchronize();
-  cudaEvent_t e0, e1;
-  cudaEventCreate(&e0); cudaEventCreate(&e1);
-  cudaEventRecord(e0);
-  for (int i = 0; i < reps; ++i)
-    attn128w16<<<grid, NTH16, SMEM128>>>(dQ, dK, dV, dO, S, T, scale);
-  cudaEventRecord(e1); cudaEventSynchronize(e1);
-  float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
-  ms /= reps;
-  double flops = 4.0 * B * S * T * 128.0;
-  printf("%.4f ms  %.1f TFLOPS\n", ms, flops / ms * 1e-9);
+  printf("D=128 分段剥离（1024t/2blk）：\n");
+  run<16, 2, 1>("ABL1 纯mma", dQ, dK, dV, dO, B, S, T, scale, reps);
+  run<16, 2, 2>("ABL2 +KV搬运", dQ, dK, dV, dO, B, S, T, scale, reps);
+  run<16, 2, 3>("ABL3 +写P(无exp2)", dQ, dK, dV, dO, B, S, T, scale, reps);
+  run<16, 2, 4>("ABL4 +exp2", dQ, dK, dV, dO, B, S, T, scale, reps);
+  run<16, 2, 5>("ABL5 完整(+检测)", dQ, dK, dV, dO, B, S, T, scale, reps);
 
-  if (argc > 4) {  // 对拍模式
+  // 32 warp × 16 行 = 512 行/block（2048 线程，1 block/SM）：S=512 时整头一格，
+  // K/V 每头只搬一次；线程/SM 仍是 2048，但寄存器上限放宽到 128（不 spill）。
+  printf("D=128 结构对照（32 warp × 16 行 = 512 行/block，1 block/SM）：\n");
+  run<32, 1, 1>("w32 ABL1 纯mma", dQ, dK, dV, dO, B, S, T, scale, reps);
+  run<32, 1, 2>("w32 ABL2 +KV", dQ, dK, dV, dO, B, S, T, scale, reps);
+  run<32, 1, 5>("w32 ABL5 完整", dQ, dK, dV, dO, B, S, T, scale, reps);
+
+  // QB=1：QK 两批各用一组 b 寄存器交错发射（+16 regs），把 4 条串行链拆成 2 路并行
+  printf("D=128 QK 双 b 组交错（QB=1）：\n");
+  run<16, 2, 1, 1>("w16 QB1 ABL1 纯mma", dQ, dK, dV, dO, B, S, T, scale, reps);
+  run<16, 2, 5, 1>("w16 QB1 ABL5 完整", dQ, dK, dV, dO, B, S, T, scale, reps);
+  run<32, 1, 1, 1>("w32 QB1 ABL1 纯mma", dQ, dK, dV, dO, B, S, T, scale, reps);
+  run<32, 1, 5, 1>("w32 QB1 ABL5 完整", dQ, dK, dV, dO, B, S, T, scale, reps);
+
+  // PF=1：把下一轮 KV 的 gmem 读提前到本轮 mma 之前发射，用寄存器暂存，
+  // 目标是把 w32 的 KV 段（0.128 ms，几乎全是 gmem 延迟）藏进计算。
+  printf("D=128 KV 预取流水（PF=1）：\n");
+  run<32, 1, 2, 0, 1>("w32 PF ABL2 +KV流水", dQ, dK, dV, dO, B, S, T, scale, reps);
+  run<32, 1, 3, 0, 1>("w32 PF ABL3 +写P", dQ, dK, dV, dO, B, S, T, scale, reps);
+  run<32, 1, 4, 0, 1>("w32 PF ABL4 +exp2", dQ, dK, dV, dO, B, S, T, scale, reps);
+  run<32, 1, 5, 0, 1>("w32 PF ABL5 完整", dQ, dK, dV, dO, B, S, T, scale, reps);
+  run<32, 1, 5, 1, 1>("w32 PF QB1 ABL5 完整", dQ, dK, dV, dO, B, S, T, scale, reps);
+
+  if (argc > 4) {  // 对拍：w32 + PF + 完整档（新结构的正确性）
+    const size_t sm = smem_bytes(32);
+    cudaFuncSetAttribute(attn128w16<32, 1, 5, 0, 1>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+    dim3 grid((S + 511) / 512, B);
+    attn128w16<32, 1, 5, 0, 1><<<grid, 2048, sm>>>(dQ, dK, dV, dO, S, T, scale);
+    cudaDeviceSynchronize();
+
     __half* hO = (__half*)malloc(nq * 2);
     cudaMemcpy(hO, dO, nq * 2, cudaMemcpyDeviceToHost);
     const int Nr = atoi(argv[4]);

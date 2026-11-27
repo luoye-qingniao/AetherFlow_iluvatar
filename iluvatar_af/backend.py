@@ -329,32 +329,49 @@ class IluvatarBackend(DeviceBackend):
         q3 = cp.ascontiguousarray(q).reshape(bh, s_len, d)
         k3 = cp.ascontiguousarray(args[1]).reshape(bh, t_len, d)
         v3 = cp.ascontiguousarray(args[2]).reshape(bh, t_len, e)
-        # TCU flash 快路径：f16、D=E=64、S/T 都是 32 的倍数。Q/K/V 只读一遍、
-        # 分数矩阵不落显存（见 codegen.flash_attention_source 的说明）。
+        # TCU flash 快路径：f16、D=E 为 64 或 128、S/T 都是 32 的倍数。
+        # Q/K/V 只读一遍、分数矩阵不落显存（见 codegen 里两份源码的说明）。
+        # D=64 → 16 warp × 16 行 = 每 block 256 行（1024 线程）；
+        # D=128 → 32 warp × 16 行 = 每 block 512 行（2048 线程），每头 K/V
+        # 只搬一次，且 2048 线程把寄存器上限放宽到 128（实测不 spill）。
         if (
-            q.dtype == cp.float16 and d == 64 and e == 64
+            q.dtype == cp.float16
+            and ((d == 64 and e == 64) or (d == 128 and e == 128))
             and s_len % 32 == 0 and t_len % 32 == 0
         ):
             # 下标 = mask 位 + 2 * dropout 位，与下面的命名顺序一致。
             kind = ("plain", "mask", "drop", "mask_drop")[
                 has_mask + 2 * (1 if p_drop > 0.0 else 0)]
-            flash = self._kernel(
-                ("flash_attn", kind),
-                lambda: self.codegen.render(
-                    self.codegen.flash_attention_source(), q.dtype),
-                "af_flash_attn_" + kind,
-            )
-            # 16 warp × 16 行 = 每 block 256 行；动态 smem = 两批 K/V + P + ones
+            if d == 64:
+                flash = self._kernel(
+                    ("flash_attn", kind),
+                    lambda: self.codegen.render(
+                        self.codegen.flash_attention_source(), q.dtype),
+                    "af_flash_attn_" + kind,
+                )
+                grid, threads = (-(-s_len // 256), bh), 1024
+                # 两批 K/V 各 4096 half + P（16×512）+ ones（512）
+                shared = (4096 + 4096 + 16 * 512 + 512) * 2
+            else:
+                flash = self._kernel(
+                    ("flash_attn128", kind),
+                    lambda: self.codegen.render(
+                        self.codegen.flash_attention128_source(), q.dtype),
+                    "af_flash_attn_d128_" + kind,
+                )
+                grid, threads = (-(-s_len // 512), bh), 2048
+                # 两批 K/V 各 8192 half + P（32×512）+ ones（512）
+                shared = (8192 + 8192 + 32 * 512 + 512) * 2
             flash(
-                (-(-s_len // 256), bh),
-                (1024,),
+                grid,
+                (threads,),
                 (
                     q3, k3, v3, out.reshape(bh, s_len, e),
                     np.int32(s_len), np.int32(t_len), scale,
                     mask, np.float32(p_drop), drop_scale, seed,
                     np.int32(mask_shared),
                 ),
-                shared_mem=(4096 + 4096 + 16 * 512 + 512) * 2,
+                shared_mem=shared,
             )
             return out
         scores = cp.empty((bh, s_len, t_len), dtype=q.dtype)
