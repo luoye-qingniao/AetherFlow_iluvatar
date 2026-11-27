@@ -1285,6 +1285,281 @@ __global__ void __launch_bounds__(NTH16, 3) attn64w16(
 }
 
 
+// ---------------------------------------------------------------- 剥离探针
+// 目的：把 plain 内核剩余的算力缺口分段定位。数值不作数（会把输出写坏），
+// 结构必须与 attn64w16<false,false> 逐条对齐（16 warp × 16 行、每轮 64 key、
+// 两批 QK、惰性基准、P@ones 分母），才能与正式数字直接比。
+//   ABL=0 完整 plain（应与正式内核同速）
+//   ABL=1 去掉 exp2：P 值取基准的动态读，保留数据依赖与 smem 写入
+//   ABL=2 去掉整个 softmax 段：不写 P、不读基准、不做风险检测，也不读回 P
+//   ABL=4 纯 mma：不搬 K/V、不碰 P、不同步，每轮只发 18 条 mma（乐观上限）
+//   ABL=10~13 在 ABL2 上逐级加：写 P → exp2 → 风险检测 → __syncwarp
+//   ABL=20~23 在完整版上正交地关/开单项，用来量 P 读回与写 P 的依赖链
+//   ABL=24 完整版但 exp2 换硬件近似 __expf(x*ln2)，验证 exp2f 是否已走硬件
+// 注意 ABL=4 删掉大量代码后寄存器下降，实际 occupancy 可能高于 3 block/SM，
+// 所以它给的是**乐观上限**，只能当下界参照，不能当"可达值"。
+template <int ABL>
+__device__ __forceinline__ float ab_exp2(float x) {
+  // 24 = 用硬件近似（__expf 走 ex2.approx），数据在 log2 空间，故补乘 ln2
+  if (ABL == 24) return __expf(x * 0.6931471805599453f);
+  return ABL == 1 ? x * 0.5f : exp2f(x);
+}
+
+template <int ABL>
+__global__ void __launch_bounds__(NTH16, 3) attn64probe(
+    const __half* __restrict__ Q, const __half* __restrict__ K,
+    const __half* __restrict__ V, __half* __restrict__ O, int S, int T,
+    float scale, const __half*, float, float, unsigned long long, int, int) {
+  extern __shared__ __half sm[];
+  __half* ksm = sm;
+  __half* vsm = ksm + 4096;
+  __half* psm = vsm + 4096;
+  __half* ones_sm = psm + NWT16 * 512;
+  __shared__ float mls[NWT16 * 16];
+
+  const int warp = threadIdx.x >> 6;
+  const int lane = threadIdx.x & 63;
+  const int r0 = lane >> 4;
+  const int c0 = lane & 15;
+  const int bh = blockIdx.y;
+  const int row_base = blockIdx.x * (16 * NWT16) + warp * 16;
+
+  const __half* Qb = Q + (long long)bh * S * 64;
+  __half* Ob = O + (long long)bh * S * 64;
+  const __half* Kb0 = K + (long long)bh * T * 64;
+  const __half* Vb0 = V + (long long)bh * T * 64;
+  __half* pw = psm + warp * 512;
+
+  fragment<matrix_a, 16, 16, 32, __half, row_major> a0, a1, pa0;
+  fragment<matrix_b, 16, 16, 32, __half, col_major> b0, b1, b2, b3, vbo;
+  fragment<accumulator, 16, 16, 32, float> s0, s1, t0, t1;
+  fragment<accumulator, 16, 16, 32, float> o0, o1, o2, o3, o4;
+
+  // Q 装载（与原内核一致，借 P 的 512 槽分两趟）
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    for (int idx = lane; idx < 512; idx += 64) {
+      int m = idx >> 5, d = idx & 31;
+      pw[off_row(m, d)] = Qb[(long long)(row_base + m) * 64 + h * 32 + d];
+    }
+    __syncwarp();
+    if (h == 0) load_matrix_sync(a0, pw, 32);
+    else        load_matrix_sync(a1, pw, 32);
+    __syncwarp();
+  }
+
+  fragment<accumulator, 16, 16, 32, float>* SF[2] = {&s0, &s1};
+  fragment<accumulator, 16, 16, 32, float>* TF[2] = {&t0, &t1};
+  fragment<accumulator, 16, 16, 32, float>* OF[5] = {&o0, &o1, &o2, &o3, &o4};
+
+#pragma unroll
+  for (int e = 0; e < 5; ++e) fill_fragment(*OF[e], 0.f);
+  for (int idx = threadIdx.x; idx < NWT16 * 16; idx += NTH16) mls[idx] = -1e30f;
+  for (int idx = threadIdx.x; idx < 512; idx += NTH16) {
+    int t = idx >> 4, dd = idx & 15;
+    ones_sm[off_col(t, dd)] = __float2half(1.f);
+  }
+  __syncthreads();
+  load_matrix_sync(vbo, ones_sm, 32);
+
+  const float sc2 = scale * AF_LOG2E;
+  float* mlr = mls + warp * 16;
+
+  // 变体开关（正交，便于逐段加/减）：
+  //   kv_on   搬 K/V + 12 次 fragment 装载 + syncthreads
+  //   sm_on   整个 softmax 段（含写 P）
+  //   use_exp2 / risk_on / sync_on  段内的三项
+  //   pld_on  PV 前从 smem 读回 P（false 时 pa0 借 a0）
+  //   vput    P 写改 volatile（无人读时防 DCE）
+  // 编号：0 完整 / 1 无exp2 / 2 只搬KV / 4 纯mma（再关 kv）
+  //   10 写P（无 exp2/检测/同步）/ 11 +exp2 / 12 +风险检 / 13 +sync
+  //   20 完整但不读回 P（量"LDS + 依赖等待"）
+  //   21 完整（自洽校验，应 ≈ 0）
+  //   22 无 exp2、无风险检，其余完整（与 21 夹出 exp2 的关键路径成本）
+  //   23 不写 P、读回陈旧值（量"写 P + 依赖链"）
+  const bool kv_on = (ABL != 4);
+  const bool sm_on = (ABL < 2) || (ABL >= 10 && ABL != 23);
+  const bool use_exp2 = (ABL != 1) && (ABL != 10) && (ABL != 22);
+  const bool risk_on = (ABL < 2) || (ABL >= 12 && ABL != 22 && ABL != 23);
+  const bool sync_on = (ABL < 2) || (ABL >= 13) || (ABL == 22) || (ABL == 23);
+  const bool pld_on = (ABL < 2) || (ABL == 3) || (ABL == 21) || (ABL == 22) ||
+                      (ABL == 23) || (ABL == 24);
+  const bool vput = (ABL == 20);
+
+  for (int kt = 0; kt < T; kt += 64) {
+    if (kv_on) {
+      load_kv(ksm, vsm, Kb0, Vb0, kt >> 5, NTH16);
+      load_kv(ksm + 2048, vsm + 2048, Kb0, Vb0, (kt >> 5) + 1, NTH16);
+      __syncthreads();
+    }
+
+    // 批 A 的 QK
+    fill_fragment(s0, 0.f);
+    fill_fragment(s1, 0.f);
+    if (kv_on) {
+      load_matrix_sync(b0, ksm, 32);
+      load_matrix_sync(b1, ksm + 512, 32);
+      load_matrix_sync(b2, ksm + 1024, 32);
+      load_matrix_sync(b3, ksm + 1536, 32);
+    } else {
+      b0 = vbo; b1 = vbo; b2 = vbo; b3 = vbo;
+    }
+    mma_sync(s0, a0, b0, s0);
+    mma_sync(s0, a1, b1, s0);
+    mma_sync(s1, a0, b2, s1);
+    mma_sync(s1, a1, b3, s1);
+
+    // 批 B 的 QK
+    fill_fragment(t0, 0.f);
+    fill_fragment(t1, 0.f);
+    if (kv_on) {
+      load_matrix_sync(b0, ksm + 2048, 32);
+      load_matrix_sync(b1, ksm + 2048 + 512, 32);
+      load_matrix_sync(b2, ksm + 2048 + 1024, 32);
+      load_matrix_sync(b3, ksm + 2048 + 1536, 32);
+    } else {
+      b0 = vbo; b1 = vbo; b2 = vbo; b3 = vbo;
+    }
+    mma_sync(t0, a0, b0, t0);
+    mma_sync(t0, a1, b1, t0);
+    mma_sync(t1, a0, b2, t1);
+    mma_sync(t1, a1, b3, t1);
+
+    // 批 A 的 softmax（ABL<2 或累加式变体 10~13 才有）
+    if (sm_on) {
+      bool risk = false;
+      if (risk_on) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const int ri = r0 + 4 * q;
+          const float lim = mlr[ri] + 8.f;
+          float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
+          float x2 = TF[0]->x[q] * sc2, x3 = TF[1]->x[q] * sc2;
+          risk |= fmaxf(fmaxf(x0, x1), fmaxf(x2, x3)) > lim;
+        }
+        if (__any_sync(0xffffffffu, risk)) {
+#pragma unroll
+          for (int q = 0; q < 4; ++q) {
+            const int ri = r0 + 4 * q;
+            const float mn = mlr[ri];
+            float x0 = SF[0]->x[q] * sc2, x1 = SF[1]->x[q] * sc2;
+            float x2 = TF[0]->x[q] * sc2, x3 = TF[1]->x[q] * sc2;
+            float mx = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
+#pragma unroll
+            for (int off = 1; off < 16; off <<= 1)
+              mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+            float corr = 1.f;
+            if (mx > mn) {
+              corr = ab_exp2<ABL>(mn - mx);
+              mlr[ri] = mx;
+            }
+#pragma unroll
+            for (int e = 0; e < 5; ++e) OF[e]->x[q] *= corr;
+          }
+        }
+      }
+      if (sync_on) __syncwarp();
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const int ri = r0 + 4 * q;
+        // volatile 读：ABL=10 不更新 mlr，普通读会被常量传播成 -1e30，
+        // 连 f16 转换都可能被提出循环，测出来的就不是真实成本。
+        const float mn = *(volatile float*)&mlr[ri];
+        float p0, p1;
+        if (use_exp2) {
+          p0 = ab_exp2<ABL>(SF[0]->x[q] * sc2 - mn);
+          p1 = ab_exp2<ABL>(SF[1]->x[q] * sc2 - mn);
+        } else {
+          p0 = mn;
+          p1 = mn;
+        }
+        const int row = r0 + 4 * q;
+        if (vput) {
+          *(volatile __half*)&pw[off_row(row, c0)] = __float2half(p0);
+          *(volatile __half*)&pw[off_row(row, 16 + c0)] = __float2half(p1);
+        } else {
+          pw[off_row(row, c0)] = __float2half(p0);
+          pw[off_row(row, 16 + c0)] = __float2half(p1);
+        }
+      }
+      if (sync_on) __syncwarp();
+    }
+
+    // 批 A 的 PV
+    if (pld_on) load_matrix_sync(pa0, pw, 32);
+    else        pa0 = a0;
+    if (kv_on) {
+      load_matrix_sync(b0, vsm, 32);
+      load_matrix_sync(b1, vsm + 512, 32);
+      load_matrix_sync(b2, vsm + 1024, 32);
+      load_matrix_sync(b3, vsm + 1536, 32);
+    } else {
+      b0 = vbo; b1 = vbo; b2 = vbo; b3 = vbo;
+    }
+    mma_sync(o0, pa0, b0, o0);
+    mma_sync(o1, pa0, b1, o1);
+    mma_sync(o2, pa0, b2, o2);
+    mma_sync(o3, pa0, b3, o3);
+    mma_sync(o4, pa0, vbo, o4);
+
+    // 批 B 的 softmax
+    if (sm_on) {
+      if (sync_on) __syncwarp();
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const int ri = r0 + 4 * q;
+        const float mn = *(volatile float*)&mlr[ri];
+        float p0, p1;
+        if (use_exp2) {
+          p0 = ab_exp2<ABL>(TF[0]->x[q] * sc2 - mn);
+          p1 = ab_exp2<ABL>(TF[1]->x[q] * sc2 - mn);
+        } else {
+          p0 = mn;
+          p1 = mn;
+        }
+        const int row = r0 + 4 * q;
+        if (vput) {
+          *(volatile __half*)&pw[off_row(row, c0)] = __float2half(p0);
+          *(volatile __half*)&pw[off_row(row, 16 + c0)] = __float2half(p1);
+        } else {
+          pw[off_row(row, c0)] = __float2half(p0);
+          pw[off_row(row, 16 + c0)] = __float2half(p1);
+        }
+      }
+      if (sync_on) __syncwarp();
+    }
+
+    // 批 B 的 PV
+    if (pld_on) load_matrix_sync(pa0, pw, 32);
+    else        pa0 = a0;
+    if (kv_on) {
+      load_matrix_sync(b0, vsm + 2048, 32);
+      load_matrix_sync(b1, vsm + 2048 + 512, 32);
+      load_matrix_sync(b2, vsm + 2048 + 1024, 32);
+      load_matrix_sync(b3, vsm + 2048 + 1536, 32);
+    } else {
+      b0 = vbo; b1 = vbo; b2 = vbo; b3 = vbo;
+    }
+    mma_sync(o0, pa0, b0, o0);
+    mma_sync(o1, pa0, b1, o1);
+    mma_sync(o2, pa0, b2, o2);
+    mma_sync(o3, pa0, b3, o3);
+    mma_sync(o4, pa0, vbo, o4);
+
+    if (kv_on) __syncthreads();
+  }
+
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    const float den = OF[4]->x[q];
+    const float inv = den != 0.f ? 1.f / den : 0.f;
+    const int row = row_base + r0 + 4 * q;
+#pragma unroll
+    for (int e = 0; e < 4; ++e)
+      Ob[row * 64 + e * 16 + c0] = __float2half(OF[e]->x[q] * inv);
+  }
+}
+
 // ---------------------------------------------------------------- bench
 
 static __half* mk_gauss(size_t n, int seed, float sd) {
@@ -1352,6 +1627,41 @@ static void ref_rows(const __half* Q, const __half* K, const __half* V, int S, i
 
 typedef void (*attn_kern)(const __half*, const __half*, const __half*, __half*, int, int,
                           float, const __half*, float, float, unsigned long long, int, int);
+
+// 剥离探针只测时间：数值是故意写坏的，不做对拍。
+static void run_probe(const char* tag, attn_kern kfn, size_t smem, int bh, int S, int T,
+                      float scale, int nthreads, int rows_per_block) {
+  size_t m = (size_t)bh * S * 64;
+  __half *bQ = mk_gauss(m, 11, 1.f), *bK = mk_gauss(m, 12, 1.f), *bV = mk_gauss(m, 13, 1.f);
+  __half *dQ, *dK, *dV, *dO;
+  cudaMalloc((void**)&dQ, m * 2); cudaMalloc((void**)&dK, m * 2);
+  cudaMalloc((void**)&dV, m * 2); cudaMalloc((void**)&dO, m * 2);
+  cudaMemcpy(dQ, bQ, m * 2, cudaMemcpyHostToDevice);
+  cudaMemcpy(dK, bK, m * 2, cudaMemcpyHostToDevice);
+  cudaMemcpy(dV, bV, m * 2, cudaMemcpyHostToDevice);
+  cudaFuncAttributes at;
+  cudaFuncGetAttributes(&at, reinterpret_cast<const void*>(kfn));
+  dim3 g(S / rows_per_block, bh);
+  for (int i = 0; i < 3; ++i)
+    kfn<<<g, nthreads, smem>>>(dQ, dK, dV, dO, S, T, scale, nullptr, 0.f, 1.f, 0ULL, 0, 0);
+  cudaDeviceSynchronize();
+  cudaEvent_t e0, e1;
+  cudaEventCreate(&e0); cudaEventCreate(&e1);
+  const int reps = 20;
+  cudaEventRecord(e0);
+  for (int i = 0; i < reps; ++i)
+    kfn<<<g, nthreads, smem>>>(dQ, dK, dV, dO, S, T, scale, nullptr, 0.f, 1.f, 0ULL, 0, 0);
+  cudaEventRecord(e1);
+  cudaEventSynchronize(e1);
+  float ms = 0.f;
+  cudaEventElapsedTime(&ms, e0, e1);
+  ms /= reps;
+  double fl = (double)bh * 4.0 * S * T * 64 * 2.0;
+  printf("[%s] regs=%d local=%d  %.4f ms  %.2f GFLOPS\n", tag, at.numRegs,
+         (int)at.localSizeBytes, ms, fl / (ms * 1e-3) / 1e9);
+  cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
+  free(bQ); free(bK); free(bV);
+}
 
 // attn32：4096(KV) + 16*1024(P) + 512(ones)
 static const size_t SMEM32 = (4096 + NWT * 1024 + 512) * 2;
@@ -1511,6 +1821,47 @@ int main(int argc, char** argv) {
     run_one("attn64w16", kw16, SMEM16, hQ, hK, hV, bh0, S, T, scale, bench_bh, hM,
             mask_shared, p_drop, seed, NTH16, 16 * NWT16);
   } else {
+    // 用法：./tcu_flash_attn 256 1 512 a  → 只跑剥离探针
+    if (strchr(md, 'a') != nullptr) {
+      const int abh = bench_bh > 0 ? bench_bh : 256;
+      printf("剥离探针  bh=%d S=%d T=%d\n", abh, S, T);
+      run_probe("ABL0 完整     ", attn64probe<0>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL1 无exp2   ", attn64probe<1>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL2 无softmax", attn64probe<2>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL3 无P读回  ", attn64probe<3>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL4 纯mma    ", attn64probe<4>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL10 只写P   ", attn64probe<10>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL11 +exp2   ", attn64probe<11>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL12 +风险检 ", attn64probe<12>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL13 +sync   ", attn64probe<13>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL20 无P读回 ", attn64probe<20>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL21 完整校验", attn64probe<21>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL22 无exp2完整", attn64probe<22>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL23 无P写有读回", attn64probe<23>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      // 重复项：ABL0 与 ABL21 逻辑等价，用两次独立测量确认差值是代码生成还是波动
+      run_probe("ABL0b 重复    ", attn64probe<0>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL21b 重复   ", attn64probe<21>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL24 exp近似 ", attn64probe<24>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      free(hQ); free(hK); free(hV);
+      if (hM) free(hM);
+      return 0;
+    }
     run_one("attn32", attn32, SMEM32, hQ, hK, hV, bh0, S, T, scale, bench_bh);
     run_one("attn64p", attn64p, SMEM64, hQ, hK, hV, bh0, S, T, scale,
             bench_bh);
