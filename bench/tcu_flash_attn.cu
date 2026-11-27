@@ -1305,8 +1305,11 @@ __device__ __forceinline__ float ab_exp2(float x) {
   return ABL == 1 ? x * 0.5f : exp2f(x);
 }
 
+// 探针主体：写成 device 函数，便于用不同 launch_bounds 包两层壳。
+// 三层 occupancy 对比（3 block/SM 是正式内核的配置，2 block/SM 是流水版的
+// 寄存器预算），用来判断"掉一个 block 的代价"是否值得换取 mma/softmax 重叠。
 template <int ABL>
-__global__ void __launch_bounds__(NTH16, 3) attn64probe(
+__device__ __forceinline__ void attn64probe_body(
     const __half* __restrict__ Q, const __half* __restrict__ K,
     const __half* __restrict__ V, __half* __restrict__ O, int S, int T,
     float scale, const __half*, float, float, unsigned long long, int, int) {
@@ -1558,6 +1561,24 @@ __global__ void __launch_bounds__(NTH16, 3) attn64probe(
     for (int e = 0; e < 4; ++e)
       Ob[row * 64 + e * 16 + c0] = __float2half(OF[e]->x[q] * inv);
   }
+}
+
+template <int ABL>
+__global__ void __launch_bounds__(NTH16, 3) attn64probe(
+    const __half* __restrict__ Q, const __half* __restrict__ K,
+    const __half* __restrict__ V, __half* __restrict__ O, int S, int T,
+    float scale, const __half* m, float d, float ds, unsigned long long sd,
+    int a, int b) {
+  attn64probe_body<ABL>(Q, K, V, O, S, T, scale, m, d, ds, sd, a, b);
+}
+
+template <int ABL>
+__global__ void __launch_bounds__(NTH16, 2) attn64probe2(
+    const __half* __restrict__ Q, const __half* __restrict__ K,
+    const __half* __restrict__ V, __half* __restrict__ O, int S, int T,
+    float scale, const __half* m, float d, float ds, unsigned long long sd,
+    int a, int b) {
+  attn64probe_body<ABL>(Q, K, V, O, S, T, scale, m, d, ds, sd, a, b);
 }
 
 // ---------------------------------------------------------------- bench
@@ -1857,6 +1878,11 @@ int main(int argc, char** argv) {
       run_probe("ABL21b 重复   ", attn64probe<21>, SMEM16, abh, S, T, scale, NTH16,
                 16 * NWT16);
       run_probe("ABL24 exp近似 ", attn64probe<24>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      // 2 block/SM：流水版的寄存器预算下，能忍受多少占用损失
+      run_probe("ABL0@2block  ", attn64probe2<0>, SMEM16, abh, S, T, scale, NTH16,
+                16 * NWT16);
+      run_probe("ABL4@2block  ", attn64probe2<4>, SMEM16, abh, S, T, scale, NTH16,
                 16 * NWT16);
       free(hQ); free(hK); free(hV);
       if (hM) free(hM);

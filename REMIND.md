@@ -1207,9 +1207,30 @@ $COREX_PATH/bin/clang++ -x ivcore --cuda-path=$COREX_PATH -O2 \
    归并、以及 `mlr` 的 smem 读有关，值得单独再测。
 5. **真瓶颈是"mma 与 softmax 全串行"**：同一 block 内 16 个 warp 同相位，
    3 个 block 也同相位（都被 `__syncthreads` 锁在 `load_kv` 上），所以
-   SM 里不存在"一批 warp 发 mma、另一批发 SFU"的重叠。想突破 37%，
-   需要跨轮软件流水（预取下一轮 QK，让 TCU 在 softmax 期间不空转），
-   代价是双份 S fragment（寄存器已顶到 84/85，很可能掉到 2 block/SM）。
+   SM 里不存在"一批 warp 发 mma、另一批发 SFU"的重叠。
+
+**跨轮流水已验证不可行（同轮补充实验）**：把探针主体抽成 device 函数，
+用 `__launch_bounds__(NTH16, 2)` 再包一层，直接测"从 3 block/SM 掉到
+2 block/SM"的代价：
+
+| 变体 | 3 block/SM | 2 block/SM |
+| --- | --- | --- |
+| 纯 mma（ABL4） | 0.2217 ms / 154.9 TF | 0.2208 ms / 155.6 TF |
+| 完整（ABL0） | 0.6197 ms | 0.7289 ms（慢 17.6%，regs 87） |
+
+- 纯 mma 在 2 block/SM 下**一点不掉**，说明 TCU 供给充足，32 warp 就能喂满；
+- 完整版掉 17.6%，损失全在 softmax 段的延迟隐藏（48 warp → 32 warp）；
+- 跨轮流水能重叠的只有 QK 那 8/18 条 mma ≈ 0.098 ms，而掉一个 block 的
+  代价是 0.109 ms，**净亏**；
+- 想保住 3 block/SM 就得做 S 双缓冲（4 个 accumulator fragment → 8 个），
+  寄存器 +16 起，当前已经 83/85，不存在空间。
+
+结论：**跨轮软件流水在 MR-V100 上不成立**，不必实现。
+若还想从 37% 往上走，只剩"削减 softmax 段本身的指令量"这一条：
+最大的一块是可推迟的风险检测（13.7%，0.085 ms）。检测频率从每轮一次
+降到每 2 轮／每 4 轮一次，同时把阈值 8 同比下调（滞后上限 2×4=8 或
+4×2=8，exp2 上界仍是 256，half 不溢出），理论可省 0.04~0.06 ms，
+代价是基准滞后变大、小项精度略降，必须重新对拍。
 
 ### 明天接着做
 
